@@ -1,0 +1,19 @@
+{
+  "name": "zrbot",
+  "version": "1.0.0",
+  "description": "",
+  "main": "vouch_counter_bot.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "better-sqlite3": "^11.10.0",
+    "discord.js": "^14.19.3",
+    "dotenv": "^16.5.0",
+    "quick.db": "^9.1.7"
+  }
+}
