@@ -3,7 +3,7 @@ const CLIENT_ID = process.env.CLIENT_ID;
 const GUILD_ID = process.env.GUILD_ID;
 const TARGET_CHANNEL_ID = '1108034288986898458'; // Channel where images are posted
 const NOTIFICATION_CHANNEL_ID = '1377459975089295392'; // Channel where notifications are sent
-const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, PermissionFlagsBits, MessageFlags, ActivityType, ActionRowBuilder, ButtonBuilder, ButtonStyle, AttachmentBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, PermissionFlagsBits, MessageFlags, ActivityType, ActionRowBuilder, ButtonBuilder, ButtonStyle, AttachmentBuilder, EmbedBuilder } = require('discord.js');
 
 // Define slash command for vouch overrides
 const setvouchesCommand = new SlashCommandBuilder()
@@ -52,6 +52,11 @@ const clearvouchesCommand = new SlashCommandBuilder()
       .setDescription('Optional: user to clear vouches for')
       .setRequired(false))
   .setDefaultMemberPermissions(PermissionFlagsBits.Administrator);
+
+// Define slash command for payments
+const paymentsCommand = new SlashCommandBuilder()
+  .setName('payments')
+  .setDescription('Display payment methods');
 
 // Function to traverse channel history and increment vouches for image attachments
 async function backfillChannelVouches(channel) {
@@ -136,7 +141,14 @@ client.on('ready', async () => {
     const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
     await rest.put(
       Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID),
-      { body: [setvouchesCommand.toJSON(), checkvouchesCommand.toJSON(), leaderboardCommand.toJSON(), backfillCommand.toJSON(), clearvouchesCommand.toJSON()] }
+      { body: [
+        setvouchesCommand.toJSON(), 
+        checkvouchesCommand.toJSON(), 
+        leaderboardCommand.toJSON(), 
+        backfillCommand.toJSON(), 
+        clearvouchesCommand.toJSON(),
+        paymentsCommand.toJSON()
+      ]}
     );
   } else {
     console.warn('Skipping slash registration: CLIENT_ID or GUILD_ID undefined.');
@@ -361,19 +373,56 @@ client.on('interactionCreate', async interaction => {
       await interaction.followUp({ content: `Processed **${total}** messages and updated vouches.`, flags: MessageFlags.Ephemeral });
     }
 
-  if (interaction.commandName === 'clearvouches') {
-    if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
-      return interaction.reply({ content: 'You do not have permission to clear vouches.', flags: MessageFlags.Ephemeral });
+    if (interaction.commandName === 'clearvouches') {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
+        return interaction.reply({ content: 'You do not have permission to clear vouches.', flags: MessageFlags.Ephemeral });
+      }
+      const targetUser = interaction.options.getUser('user');
+      if (targetUser) {
+        await db.set(`vouches.${targetUser.id}`, 0);
+        return interaction.reply({ content: `Cleared vouches for <@${targetUser.id}>.`, flags: MessageFlags.Ephemeral });
+      } else {
+        await db.set('vouches', {});
+        return interaction.reply({ content: 'Cleared vouches for all users.', flags: MessageFlags.Ephemeral });
+      }
     }
-    const targetUser = interaction.options.getUser('user');
-    if (targetUser) {
-      await db.set(`vouches.${targetUser.id}`, 0);
-      return interaction.reply({ content: `Cleared vouches for <@${targetUser.id}>.`, flags: MessageFlags.Ephemeral });
-    } else {
-      await db.set('vouches', {});
-      return interaction.reply({ content: 'Cleared vouches for all users.', flags: MessageFlags.Ephemeral });
+
+    if (interaction.commandName === 'payments') {
+      const embed = new EmbedBuilder()
+        .setTitle("ZR's Payments")
+        .setDescription("Select which payment method you would like to use!")
+        .setColor(0x9932cc);
+
+      const row1 = new ActionRowBuilder()
+        .addComponents(
+          new ButtonBuilder()
+            .setCustomId('payment_zelle1')
+            .setLabel('Zelle 1')
+            .setStyle(ButtonStyle.Danger)
+            .setEmoji('🏦'),
+          new ButtonBuilder()
+            .setCustomId('payment_zelle2')
+            .setLabel('Zelle 2')
+            .setStyle(ButtonStyle.Danger)
+            .setEmoji('🏦')
+        );
+
+      const row2 = new ActionRowBuilder()
+        .addComponents(
+          new ButtonBuilder()
+            .setCustomId('payment_paypal1')
+            .setLabel('PayPal 1')
+            .setStyle(ButtonStyle.Success)
+            .setEmoji('💚'),
+          new ButtonBuilder()
+            .setCustomId('payment_paypal2')
+            .setLabel('PayPal 2')
+            .setStyle(ButtonStyle.Success)
+            .setEmoji('💚')
+        );
+
+      await interaction.reply({ embeds: [embed], components: [row1, row2] });
     }
-  }
   }
 
   // Handle button interactions for leaderboard pagination
@@ -431,6 +480,79 @@ client.on('interactionCreate', async interaction => {
         content: content, 
         components: [row] 
       });
+    }
+
+    // Handle payment button interactions
+    if (interaction.customId.startsWith('payment_')) {
+      const paymentType = interaction.customId.replace('payment_', '');
+      
+      let embed, copyableRow;
+      
+      if (paymentType === 'zelle1') {
+        embed = new EmbedBuilder()
+          .setTitle("💳 Zelle Payment 1")
+          .setColor(0x6534D1)
+          .addFields(
+            { name: "Phone Number:", value: "```857-756-2574```", inline: false },
+            { name: "📝 Note:", value: "Send as Friends & Family", inline: false }
+          );
+      } else if (paymentType === 'zelle2') {
+        embed = new EmbedBuilder()
+          .setTitle("💳 Zelle Payment 2")
+          .setColor(0x6534D1)
+          .addFields(
+            { name: "Email:", value: "```richardxu1400@gmail.com```", inline: false },
+            { name: "📝 Note:", value: "Send as Friends & Family", inline: false }
+          );
+      } else if (paymentType === 'paypal1') {
+        embed = new EmbedBuilder()
+          .setTitle("💚 PayPal Payment 1")
+          .setColor(0x00CF31)
+          .addFields(
+            { name: "Email:", value: "```richardxu1400@gmail.com```", inline: false },
+            { name: "📝 Note:", value: "Friends & Family, no notes", inline: false }
+          );
+      } else if (paymentType === 'paypal2') {
+        embed = new EmbedBuilder()
+          .setTitle("💚 PayPal Payment 2")
+          .setColor(0x00CF31)
+          .addFields(
+            { name: "Email:", value: "```testtesttestmaverick@gmail.com```", inline: false },
+            { name: "📝 Note:", value: "Friends & Family, no notes", inline: false }
+          );
+      }
+
+      copyableRow = new ActionRowBuilder()
+        .addComponents(
+          new ButtonBuilder()
+            .setCustomId(`copyable_${paymentType}`)
+            .setLabel('📋 Get Copyable Info')
+            .setStyle(ButtonStyle.Secondary)
+            .setEmoji('📱')
+        );
+
+      await interaction.reply({ embeds: [embed], components: [copyableRow], flags: MessageFlags.Ephemeral });
+    }
+
+    // Handle copyable info buttons
+    if (interaction.customId.startsWith('copyable_')) {
+      const paymentType = interaction.customId.replace('copyable_', '');
+      
+      let message;
+      
+      if (paymentType === 'zelle1') {
+        message = "857-756-2574";
+      } else if (paymentType === 'zelle2') {
+        message = "richardxu1400@gmail.com";
+      } else if (paymentType === 'paypal1') {
+        message = "richardxu1400@gmail.com";
+      } else if (paymentType === 'paypal2') {
+        message = "testtesttestmaverick@gmail.com";
+      } else {
+        message = "Payment information not available.";
+      }
+
+      await interaction.followUp({ content: message, flags: MessageFlags.Ephemeral });
     }
   }
 });
