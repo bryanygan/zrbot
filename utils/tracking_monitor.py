@@ -357,7 +357,7 @@ def _build_eta_countdown(delivery_info: dict, category: str) -> str:
 
 
 def build_tracking_view(tracking_number: str, *, delivered: bool = False) -> discord.ui.View:
-    """Build a persistent button row for a tracking embed."""
+    """Build a persistent button row for a tracking embed (live-updating channels)."""
     view = discord.ui.View(timeout=None)
     view.add_item(discord.ui.Button(
         label="Track on USPS",
@@ -384,6 +384,36 @@ def build_tracking_view(tracking_number: str, *, delivered: bool = False) -> dis
             style=discord.ButtonStyle.success,
             emoji="\u2705",
         ))
+    return view
+
+
+def build_dm_tracking_view(tracking_number: str) -> discord.ui.View:
+    """Build a persistent button row for a DM tracking embed (static, with opt-in for live updates)."""
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(
+        label="Track on USPS",
+        style=discord.ButtonStyle.link,
+        url=f"{USPS_TRACKING_PAGE}{tracking_number}",
+        emoji="\U0001f517",
+    ))
+    view.add_item(discord.ui.Button(
+        custom_id=f"tracking_details_{tracking_number}",
+        label="Show Details",
+        style=discord.ButtonStyle.secondary,
+        emoji="\U0001f4cb",
+    ))
+    view.add_item(discord.ui.Button(
+        custom_id=f"tracking_copy_{tracking_number}",
+        label="Copy #",
+        style=discord.ButtonStyle.secondary,
+        emoji="\U0001f4ce",
+    ))
+    view.add_item(discord.ui.Button(
+        custom_id=f"tracking_live_{tracking_number}",
+        label="Get Live Updates",
+        style=discord.ButtonStyle.primary,
+        emoji="\U0001f514",
+    ))
     return view
 
 

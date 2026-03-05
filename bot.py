@@ -290,6 +290,48 @@ async def on_interaction(interaction: discord.Interaction):
         tn = custom_id.removeprefix("tracking_copy_")
         await interaction.response.send_message(tn)
 
+    elif custom_id.startswith("tracking_live_"):
+        tn = custom_id.removeprefix("tracking_live_")
+        monitor = getattr(bot, "tracking_monitor", None)
+        if not monitor:
+            return await interaction.response.send_message("Tracking monitor is not configured.", ephemeral=True)
+
+        entry = monitor.tracking_data.get(tn)
+        if not entry:
+            return await interaction.response.send_message(f"`{tn}` is no longer being tracked.", ephemeral=True)
+
+        await interaction.response.defer(ephemeral=True)
+
+        # Fetch latest tracking data
+        result = await monitor.check_single(tn)
+        if not result or "error" in result or result.get("statusCode") == "404":
+            result = {
+                "statusCategory": entry.get("last_status_category") or "Waiting for USPS",
+                "status": entry.get("last_status") or "Waiting for USPS",
+                "statusSummary": "Tracking data not yet available from USPS.",
+                "trackingEvents": [],
+            }
+
+        from utils.tracking_monitor import build_tracking_embed, build_tracking_view, _save_tracking, _log_to_channel, USPS_LOGO_URL
+
+        category = result.get("statusCategory", "")
+        is_delivered = category == "Delivered"
+        embed = build_tracking_embed(tn, result, entry.get("user_id"), logo_url=USPS_LOGO_URL, package_label=entry.get("label"))
+        view = build_tracking_view(tn, delivered=is_delivered)
+
+        try:
+            # Send live-updating embed via bot DM to the user who clicked
+            dm_msg = await interaction.user.send(embed=embed, view=view)
+            # Store the bot DM channel/message so future polls can edit it
+            entry["channel_id"] = dm_msg.channel.id
+            entry["message_id"] = dm_msg.id
+            _save_tracking(monitor.tracking_data)
+            bot.add_view(build_tracking_view(tn, delivered=is_delivered))
+            await interaction.followup.send("Live tracking updates will be sent to your DMs!", ephemeral=True)
+            await _log_to_channel(bot, f"\U0001f514 **{interaction.user}** opted in to live updates for `{tn}`")
+        except discord.Forbidden:
+            await interaction.followup.send("I can't DM you. Please enable DMs from server members or add me as a friend.", ephemeral=True)
+
     elif custom_id.startswith("tracking_confirm_"):
         tn = custom_id.removeprefix("tracking_confirm_")
         embed = discord.Embed(
@@ -394,10 +436,11 @@ async def on_ready():
     if bot.tracking_monitor:
         bot.tracking_monitor.start()
         logger.info("USPS tracking monitor started")
-        from utils.tracking_monitor import build_tracking_view
+        from utils.tracking_monitor import build_tracking_view, build_dm_tracking_view
         for tn, entry in bot.tracking_monitor.tracking_data.items():
             is_delivered = entry.get("last_status_category") == "Delivered"
             bot.add_view(build_tracking_view(tn, delivered=is_delivered))
+            bot.add_view(build_dm_tracking_view(tn))
 
     # Sync commands to the guild and globally (global needed for DM support)
     await bot.tree.sync()

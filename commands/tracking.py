@@ -61,7 +61,7 @@ def setup(bot: commands.Bot):
 
         result = await monitor.check_single(tn)
 
-        from utils.tracking_monitor import build_tracking_embed, build_tracking_view, _save_tracking, _log_to_channel, USPS_LOGO_URL
+        from utils.tracking_monitor import build_tracking_embed, build_tracking_view, build_dm_tracking_view, _save_tracking, _log_to_channel, USPS_LOGO_URL
 
         usps_not_found = not result or "error" in result or result.get("statusCode") == "404"
 
@@ -73,10 +73,21 @@ def setup(bot: commands.Bot):
                 "trackingEvents": [],
             }
 
+        is_dm = interaction.guild is None
         embed = build_tracking_embed(tn, result, user_id, logo_url=USPS_LOGO_URL, package_label=label)
-        view = build_tracking_view(tn)
-        msg = await interaction.followup.send(embed=embed, view=view, wait=True)
-        await monitor.add(tn, user_id, channel_id=msg.channel.id, message_id=msg.id, label=label)
+
+        if is_dm:
+            # DM context: static embed with opt-in for live updates
+            embed.set_footer(text="USPS Tracking \u2022 Use 'Get Live Updates' for automatic updates")
+            view = build_dm_tracking_view(tn)
+            msg = await interaction.followup.send(embed=embed, view=view, wait=True)
+            # Store without channel/message so we don't try to edit in user-user DM
+            await monitor.add(tn, user_id, channel_id=None, message_id=None, label=label)
+        else:
+            # Channel context: live-updating embed
+            view = build_tracking_view(tn)
+            msg = await interaction.followup.send(embed=embed, view=view, wait=True)
+            await monitor.add(tn, user_id, channel_id=msg.channel.id, message_id=msg.id, label=label)
 
         entry = monitor.tracking_data[tn]
         entry["last_status_category"] = result.get("statusCategory")
@@ -292,8 +303,9 @@ def setup(bot: commands.Bot):
 
         await interaction.response.defer(ephemeral=False)
 
-        from utils.tracking_monitor import build_tracking_embed, build_tracking_view, _save_tracking, _log_to_channel, USPS_LOGO_URL
+        from utils.tracking_monitor import build_tracking_embed, build_tracking_view, build_dm_tracking_view, _save_tracking, _log_to_channel, USPS_LOGO_URL
 
+        is_dm = interaction.guild is None
         added = []
         skipped = []
         for tn in numbers:
@@ -312,9 +324,16 @@ def setup(bot: commands.Bot):
                 }
 
             embed = build_tracking_embed(tn, result, user_id, logo_url=USPS_LOGO_URL)
-            view = build_tracking_view(tn)
-            msg = await interaction.followup.send(embed=embed, view=view, wait=True)
-            await monitor.add(tn, user_id, channel_id=msg.channel.id, message_id=msg.id)
+
+            if is_dm:
+                embed.set_footer(text="USPS Tracking \u2022 Use 'Get Live Updates' for automatic updates")
+                view = build_dm_tracking_view(tn)
+                msg = await interaction.followup.send(embed=embed, view=view, wait=True)
+                await monitor.add(tn, user_id, channel_id=None, message_id=None)
+            else:
+                view = build_tracking_view(tn)
+                msg = await interaction.followup.send(embed=embed, view=view, wait=True)
+                await monitor.add(tn, user_id, channel_id=msg.channel.id, message_id=msg.id)
 
             entry = monitor.tracking_data[tn]
             entry["last_status_category"] = result.get("statusCategory")
