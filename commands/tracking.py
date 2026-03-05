@@ -13,6 +13,8 @@ def _is_authorized(interaction: discord.Interaction) -> bool:
 
 def setup(bot: commands.Bot):
     @bot.tree.command(name="track", description="Start tracking a USPS package")
+    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
     @app_commands.describe(
         tracking_number="USPS tracking number",
         user="The Discord user this package is for (auto-detected in DMs)",
@@ -78,6 +80,8 @@ def setup(bot: commands.Bot):
         _save_tracking(monitor.tracking_data)
 
     @bot.tree.command(name="untrack", description="Stop tracking a USPS package")
+    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
     @app_commands.describe(tracking_number="USPS tracking number to stop tracking")
     async def untrack_command(
         interaction: discord.Interaction,
@@ -105,6 +109,8 @@ def setup(bot: commands.Bot):
             )
 
     @bot.tree.command(name="trackinglist", description="Show all tracked packages")
+    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
     async def trackinglist_command(interaction: discord.Interaction):
         if not _is_authorized(interaction):
             return await interaction.response.send_message(
@@ -161,6 +167,8 @@ def setup(bot: commands.Bot):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @bot.tree.command(name="trackrefresh", description="Force refresh all tracked packages now")
+    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
     async def trackrefresh_command(interaction: discord.Interaction):
         if not _is_authorized(interaction):
             return await interaction.response.send_message(
@@ -185,6 +193,8 @@ def setup(bot: commands.Bot):
         )
 
     @bot.tree.command(name="trackinfo", description="Get current tracking info for a package")
+    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
     @app_commands.describe(tracking_number="USPS tracking number")
     async def trackinfo_command(
         interaction: discord.Interaction,
