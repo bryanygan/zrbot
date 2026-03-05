@@ -1,0 +1,33 @@
+# Environment
+.env
+.env.*
+
+# Data
+data/
+vouches.json
+json.sqlite
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.venv/
+
+# Node (legacy)
+node_modules/
+package-lock.json
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# pytest
+.pytest_cache/
+".env" 

@@ -1,0 +1,519 @@
+"""USPS package tracking monitor with polling and Discord notifications."""
+
+import json
+import logging
+import os
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+import aiohttp
+import discord
+from discord.ext import tasks
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+OWNER_ID = 745694160002089130
+
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+TRACKING_FILE = DATA_DIR / "tracking.json"
+
+USPS_TOKEN_URL = "https://api.usps.com/oauth2/v3/token"
+USPS_TRACKING_URL = "https://apis.usps.com/tracking/v3r2/tracking"
+BATCH_SIZE = 35  # USPS max per request
+
+BASE_POLL_MINUTES = 30
+MIN_POLL_MINUTES = 15
+MAX_POLL_MINUTES = 60
+
+# Status category → (color, emoji, short label)
+STATUS_CONFIG = {
+    "Delivered":           (0x57F287, "\U0001f4ec", "Delivered"),           # green, 📬
+    "Out for Delivery":    (0x3498DB, "\U0001f69a", "Out for Delivery"),    # blue, 🚚
+    "On the Way":          (0x5865F2, "\U0001f4e6", "In Transit"),          # blurple, 📦
+    "In Transit":          (0x5865F2, "\U0001f4e6", "In Transit"),
+    "International Transit":(0x9B59B6, "\U0001f30d", "International Transit"),  # purple, 🌍
+    "USPS Awaiting Item":  (0x95A5A6, "\U0001f3f7\ufe0f", "Awaiting Pickup"),  # gray, 🏷️
+    "Shipping Label Created": (0x95A5A6, "\U0001f3f7\ufe0f", "Label Created"),
+    "Alert":               (0xED4245, "\u26a0\ufe0f", "Alert"),              # red, ⚠️
+    "Return to Sender":    (0xED4245, "\u21a9\ufe0f", "Returned"),           # red, ↩️
+    "Delivery Attempt":    (0xE67E22, "\U0001f4cb", "Delivery Attempted"),  # orange, 📋
+    "Available for Pickup":(0xE67E22, "\U0001f4ee", "Ready for Pickup"),    # orange, 📮
+    "Pre-Shipment":        (0x95A5A6, "\U0001f4dd", "Pre-Shipment"),       # gray, 📝
+}
+
+DEFAULT_STATUS_CONFIG = (0x95A5A6, "\U0001f4e6", "Unknown Status")  # gray, 📦
+
+# Categories that should trigger a DM notification
+DM_TRIGGER_CATEGORIES = {
+    "Delivered", "Out for Delivery",
+    "Alert", "Return to Sender", "Delivery Attempt", "Available for Pickup",
+}
+
+# Categories that are terminal (auto-remove after notification)
+TERMINAL_CATEGORIES = {"Delivered", "Return to Sender"}
+
+
+# ---------------------------------------------------------------------------
+# Token management (shared with address_parser)
+# ---------------------------------------------------------------------------
+
+_usps_token: str | None = None
+_usps_token_expires: float = 0
+
+
+async def _get_usps_token(consumer_key: str, consumer_secret: str) -> str:
+    global _usps_token, _usps_token_expires
+
+    if _usps_token and time.time() < _usps_token_expires:
+        return _usps_token
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(USPS_TOKEN_URL, data={
+            "grant_type": "client_credentials",
+            "client_id": consumer_key,
+            "client_secret": consumer_secret,
+        }) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"USPS OAuth failed ({resp.status})")
+            body = await resp.json()
+
+    _usps_token = body["access_token"]
+    _usps_token_expires = time.time() + body.get("expires_in", 28800) - 300
+    return _usps_token
+
+
+# ---------------------------------------------------------------------------
+# Persistent storage
+# ---------------------------------------------------------------------------
+
+def _load_tracking() -> dict:
+    if TRACKING_FILE.exists():
+        try:
+            return json.loads(TRACKING_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            logger.warning("Corrupt tracking file, starting fresh")
+    return {}
+
+
+def _save_tracking(data: dict) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    TRACKING_FILE.write_text(json.dumps(data, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# USPS API
+# ---------------------------------------------------------------------------
+
+async def _fetch_tracking_batch(
+    tracking_numbers: list[str],
+    consumer_key: str,
+    consumer_secret: str,
+) -> list[dict]:
+    """Fetch tracking info for up to 35 tracking numbers."""
+    token = await _get_usps_token(consumer_key, consumer_secret)
+    payload = [{"trackingNumber": tn} for tn in tracking_numbers]
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            USPS_TRACKING_URL,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        ) as resp:
+            if resp.status == 429:
+                retry_after = int(resp.headers.get("Retry-After", "60"))
+                logger.warning("USPS rate limited, retry after %ds", retry_after)
+                raise RateLimitError(retry_after)
+            if resp.status != 200:
+                # 207 multi-status also possible — body is still valid JSON array
+                pass
+            body = await resp.json()
+
+    # Normalize: single-item responses may not be a list
+    if isinstance(body, dict):
+        # Error response for the whole request
+        if "error" in body:
+            logger.warning("USPS batch error: %s", body["error"].get("message"))
+            return []
+        return [body]
+    return body
+
+
+class RateLimitError(Exception):
+    def __init__(self, retry_after: int):
+        self.retry_after = retry_after
+        super().__init__(f"Rate limited for {retry_after}s")
+
+
+# ---------------------------------------------------------------------------
+# Embed builders
+# ---------------------------------------------------------------------------
+
+def _clean_mail_class(raw: str) -> str:
+    """Strip HTML tags from mail class (e.g. 'Priority Mail<SUP>&reg;</SUP>')."""
+    import re
+    cleaned = re.sub(r'<[^>]+>', '', raw)
+    cleaned = cleaned.replace('&reg;', '\u00ae').replace('&#153;', '\u2122')
+    cleaned = cleaned.replace('&amp;', '&')
+    return cleaned.strip()
+
+
+def _format_location(event: dict) -> str:
+    city = event.get("eventCity", "")
+    state = event.get("eventState", "")
+    zip_code = event.get("eventZIPCode", "")
+    parts = []
+    if city:
+        parts.append(city.title())
+    if state:
+        parts.append(state)
+    if zip_code:
+        parts.append(zip_code)
+    if not parts:
+        return "Unknown Location"
+    # Format: "City, ST 12345"
+    if len(parts) >= 2 and parts[-1].isdigit():
+        return f"{', '.join(parts[:-1])} {parts[-1]}"
+    return ", ".join(parts)
+
+
+def _format_event_time(event: dict) -> str:
+    ts = event.get("eventTimestamp", "")
+    if not ts:
+        return ""
+    try:
+        dt = datetime.fromisoformat(ts)
+        return f"<t:{int(dt.timestamp())}:f>"
+    except (ValueError, TypeError):
+        return ts
+
+
+def build_tracking_embed(
+    tracking_number: str,
+    data: dict,
+    user_id: int | None = None,
+    *,
+    show_history: bool = True,
+    max_events: int = 6,
+) -> discord.Embed:
+    """Build a rich embed for a tracking update."""
+    category = data.get("statusCategory", "Unknown")
+    color, emoji, label = STATUS_CONFIG.get(category, DEFAULT_STATUS_CONFIG)
+
+    status_text = data.get("status", category)
+    summary = data.get("statusSummary", "")
+    mail_class = _clean_mail_class(data.get("mailClass", ""))
+    events = data.get("trackingEvents", [])
+    delivery_info = data.get("deliveryDateExpectation", {})
+
+    embed = discord.Embed(
+        title=f"{emoji}  {label}",
+        description=summary if summary else None,
+        color=color,
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    # Header fields
+    embed.add_field(name="Tracking #", value=f"`{tracking_number}`", inline=True)
+    if mail_class:
+        embed.add_field(name="Service", value=mail_class, inline=True)
+    if user_id:
+        embed.add_field(name="Recipient", value=f"<@{user_id}>", inline=True)
+
+    # Expected delivery date
+    exp_date = delivery_info.get("expectedDeliveryDate") or delivery_info.get("predictedDeliveryDate")
+    if exp_date and category not in TERMINAL_CATEGORIES:
+        try:
+            dt = datetime.strptime(exp_date, "%Y-%m-%d")
+            embed.add_field(
+                name="Expected Delivery",
+                value=f"<t:{int(dt.timestamp())}:D>",
+                inline=True,
+            )
+        except ValueError:
+            embed.add_field(name="Expected Delivery", value=exp_date, inline=True)
+
+    # Latest location
+    if events:
+        latest = events[0]
+        loc = _format_location(latest)
+        embed.add_field(name="Current Location", value=loc, inline=True)
+
+    # Tracking history
+    if show_history and events:
+        history_lines = []
+        for ev in events[:max_events]:
+            ev_time = _format_event_time(ev)
+            ev_type = ev.get("eventType", "Unknown")
+            ev_loc = _format_location(ev)
+            if ev_time:
+                history_lines.append(f"{ev_time}\n{ev_type} \u2014 {ev_loc}")
+            else:
+                history_lines.append(f"{ev_type} \u2014 {ev_loc}")
+
+        # Split into chunks if too long for one field (1024 char limit)
+        history_text = "\n\n".join(history_lines)
+        if len(history_text) <= 1024:
+            embed.add_field(
+                name="Tracking History",
+                value=history_text,
+                inline=False,
+            )
+        else:
+            # Truncate to fit
+            truncated = []
+            total = 0
+            for line in history_lines:
+                if total + len(line) + 2 > 1000:
+                    break
+                truncated.append(line)
+                total += len(line) + 2
+            embed.add_field(
+                name="Tracking History",
+                value="\n\n".join(truncated) + f"\n*...and {len(events) - len(truncated)} more events*",
+                inline=False,
+            )
+
+    if category == "Delivered":
+        embed.add_field(
+            name="Thank You!",
+            value="Please leave a vouch if your package arrived safe! If you have any questions/concerns about the package, please feel free to reach out!",
+            inline=False,
+        )
+
+    embed.set_footer(text="USPS Tracking • Last checked")
+    return embed
+
+
+# ---------------------------------------------------------------------------
+# Core monitor
+# ---------------------------------------------------------------------------
+
+class TrackingMonitor:
+    """Manages tracked packages and polls USPS for updates."""
+
+    def __init__(self, bot: discord.Client, consumer_key: str, consumer_secret: str):
+        self.bot = bot
+        self.consumer_key = consumer_key
+        self.consumer_secret = consumer_secret
+        self.tracking_data = _load_tracking()
+        self._poll_loop.change_interval(minutes=BASE_POLL_MINUTES)
+
+    def start(self):
+        if not self._poll_loop.is_running():
+            self._poll_loop.start()
+            logger.info("Tracking monitor started (interval: %d min)", self._poll_interval_minutes)
+
+    def stop(self):
+        if self._poll_loop.is_running():
+            self._poll_loop.cancel()
+
+    @property
+    def _poll_interval_minutes(self) -> int:
+        count = len(self.tracking_data)
+        if count == 0:
+            return MAX_POLL_MINUTES
+        if count <= 35:
+            return BASE_POLL_MINUTES
+        if count <= 70:
+            return 20
+        return MIN_POLL_MINUTES
+
+    def _update_interval(self):
+        new_interval = self._poll_interval_minutes
+        if self._poll_loop.minutes != new_interval:
+            self._poll_loop.change_interval(minutes=new_interval)
+            logger.info("Poll interval adjusted to %d minutes (%d packages)",
+                        new_interval, len(self.tracking_data))
+
+    # -- Public API --
+
+    def add(
+        self,
+        tracking_number: str,
+        user_id: int,
+        channel_id: int | None = None,
+        message_id: int | None = None,
+    ) -> bool:
+        """Add a tracking number. Returns False if already tracked."""
+        tn = tracking_number.strip().upper()
+        if tn in self.tracking_data:
+            return False
+
+        self.tracking_data[tn] = {
+            "user_id": user_id,
+            "channel_id": channel_id,      # None = DM mode
+            "message_id": message_id,       # Embed message to edit (in-channel mode)
+            "added_at": datetime.now(timezone.utc).isoformat(),
+            "last_status_category": None,
+            "last_status": None,
+            "notified_out_for_delivery": False,
+            "notified_delivered": False,
+            "notified_problem": False,
+        }
+        _save_tracking(self.tracking_data)
+        self._update_interval()
+        return True
+
+    def remove(self, tracking_number: str) -> bool:
+        tn = tracking_number.strip().upper()
+        if tn not in self.tracking_data:
+            return False
+        del self.tracking_data[tn]
+        _save_tracking(self.tracking_data)
+        self._update_interval()
+        return True
+
+    def list_all(self) -> dict:
+        return dict(self.tracking_data)
+
+    async def check_single(self, tracking_number: str) -> dict | None:
+        """Fetch tracking for a single number. Returns API response or None."""
+        try:
+            results = await _fetch_tracking_batch(
+                [tracking_number], self.consumer_key, self.consumer_secret,
+            )
+            for r in results:
+                if r.get("trackingNumber", "").upper() == tracking_number.upper():
+                    return r
+            return results[0] if results else None
+        except Exception as exc:
+            logger.warning("Failed to check %s: %s", tracking_number, exc)
+            return None
+
+    # -- Background loop --
+
+    @tasks.loop(minutes=BASE_POLL_MINUTES)
+    async def _poll_loop(self):
+        if not self.tracking_data:
+            return
+
+        tracking_numbers = list(self.tracking_data.keys())
+        logger.info("Polling %d tracked packages...", len(tracking_numbers))
+
+        # Process in batches of 35
+        for batch_start in range(0, len(tracking_numbers), BATCH_SIZE):
+            batch = tracking_numbers[batch_start:batch_start + BATCH_SIZE]
+            try:
+                results = await _fetch_tracking_batch(
+                    batch, self.consumer_key, self.consumer_secret,
+                )
+            except RateLimitError as e:
+                logger.warning("Rate limited, skipping remaining batches. Retry in %ds", e.retry_after)
+                return
+            except Exception as exc:
+                logger.error("Batch fetch error: %s", exc)
+                continue
+
+            for result in results:
+                tn = result.get("trackingNumber", "").upper()
+                if tn not in self.tracking_data:
+                    continue
+
+                # Check for API-level errors on this tracking number
+                if "error" in result or result.get("statusCode") == "404":
+                    continue
+
+                entry = self.tracking_data[tn]
+                new_category = result.get("statusCategory", "")
+                old_category = entry.get("last_status_category")
+
+                # Update stored status
+                entry["last_status_category"] = new_category
+                entry["last_status"] = result.get("status", "")
+
+                # -- In-channel mode: edit the embed message --
+                if entry.get("channel_id") and entry.get("message_id"):
+                    await self._update_channel_embed(tn, entry, result)
+
+                # -- DM notifications for trigger categories --
+                if new_category != old_category and new_category in DM_TRIGGER_CATEGORIES:
+                    await self._send_dm_notification(tn, entry, result, new_category)
+
+            _save_tracking(self.tracking_data)
+
+            # Small delay between batches to be polite to the API
+            if batch_start + BATCH_SIZE < len(tracking_numbers):
+                import asyncio
+                await asyncio.sleep(2)
+
+    @_poll_loop.before_loop
+    async def _before_poll(self):
+        await self.bot.wait_until_ready()
+
+    # -- Notification helpers --
+
+    async def _send_dm_notification(
+        self, tn: str, entry: dict, result: dict, category: str,
+    ):
+        """Send a DM to the owner about a tracking status change."""
+        # Determine which notification flag to check/set
+        flag_map = {
+            "Out for Delivery": "notified_out_for_delivery",
+            "Delivered": "notified_delivered",
+        }
+        # Problem categories share one flag
+        problem_cats = {"Alert", "Return to Sender", "Delivery Attempt", "Available for Pickup"}
+
+        if category in flag_map:
+            flag = flag_map[category]
+        elif category in problem_cats:
+            flag = "notified_problem"
+        else:
+            return
+
+        if entry.get(flag):
+            return  # Already notified
+
+        entry[flag] = True
+
+        try:
+            owner = await self.bot.fetch_user(OWNER_ID)
+            embed = build_tracking_embed(tn, result, entry.get("user_id"))
+            await owner.send(embed=embed)
+            logger.info("DM sent for %s → %s", tn, category)
+        except Exception as exc:
+            logger.error("Failed to DM owner for %s: %s", tn, exc)
+
+        # Auto-remove terminal packages
+        if category in TERMINAL_CATEGORIES:
+            del self.tracking_data[tn]
+            logger.info("Auto-removed delivered package %s", tn)
+
+    async def _update_channel_embed(
+        self, tn: str, entry: dict, result: dict,
+    ):
+        """Edit the in-channel tracking embed with latest data."""
+        channel_id = entry.get("channel_id")
+        message_id = entry.get("message_id")
+        if not channel_id or not message_id:
+            return
+
+        try:
+            channel = self.bot.get_channel(channel_id)
+            if not channel:
+                channel = await self.bot.fetch_channel(channel_id)
+            message = await channel.fetch_message(message_id)
+            embed = build_tracking_embed(
+                tn, result, entry.get("user_id"), show_history=True,
+            )
+            await message.edit(embed=embed)
+        except discord.NotFound:
+            # Message was deleted — switch to DM-only mode
+            entry["channel_id"] = None
+            entry["message_id"] = None
+            logger.warning("Tracking message deleted for %s, switching to DM mode", tn)
+        except Exception as exc:
+            logger.error("Failed to update channel embed for %s: %s", tn, exc)
+
+    async def force_poll(self):
+        """Manually trigger a poll cycle (for the /trackrefresh command)."""
+        await self._poll_loop.coro(self)
