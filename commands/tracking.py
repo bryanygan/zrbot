@@ -60,7 +60,7 @@ def setup(bot: commands.Bot):
 
         embed = build_tracking_embed(tn, result, user.id, logo_url=USPS_LOGO_URL)
         msg = await interaction.followup.send(embed=embed, wait=True)
-        monitor.add(tn, user.id, channel_id=msg.channel.id, message_id=msg.id)
+        await monitor.add(tn, user.id, channel_id=msg.channel.id, message_id=msg.id)
 
         entry = monitor.tracking_data[tn]
         entry["last_status_category"] = result.get("statusCategory")

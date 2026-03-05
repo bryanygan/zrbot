@@ -1,5 +1,6 @@
 """USPS package tracking monitor with polling and Discord notifications."""
 
+import asyncio
 import json
 import logging
 import os
@@ -30,6 +31,7 @@ BATCH_SIZE = 35  # USPS max per request
 BASE_POLL_MINUTES = 30
 MIN_POLL_MINUTES = 15
 MAX_POLL_MINUTES = 60
+MAX_TRACKING_DAYS = 60  # Auto-remove packages older than this
 
 # USPS logo thumbnail — swap between the two logos here:
 # "USPS-Logo.png" (icon only) or "USPS_Logo_Text.webp" (icon + text)
@@ -107,7 +109,9 @@ def _load_tracking() -> dict:
 
 def _save_tracking(data: dict) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    TRACKING_FILE.write_text(json.dumps(data, indent=2))
+    tmp = TRACKING_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.replace(TRACKING_FILE)
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +402,7 @@ class TrackingMonitor:
         self.consumer_key = consumer_key
         self.consumer_secret = consumer_secret
         self.tracking_data = _load_tracking()
+        self._lock = asyncio.Lock()
         self._poll_loop.change_interval(minutes=BASE_POLL_MINUTES)
 
     def start(self):
@@ -429,7 +434,7 @@ class TrackingMonitor:
 
     # -- Public API --
 
-    def add(
+    async def add(
         self,
         tracking_number: str,
         user_id: int,
@@ -438,23 +443,27 @@ class TrackingMonitor:
     ) -> bool:
         """Add a tracking number. Returns False if already tracked."""
         tn = tracking_number.strip().upper()
-        if tn in self.tracking_data:
-            return False
+        async with self._lock:
+            if tn in self.tracking_data:
+                return False
 
-        self.tracking_data[tn] = {
-            "user_id": user_id,
-            "channel_id": channel_id,      # None = DM mode
-            "message_id": message_id,       # Embed message to edit (in-channel mode)
-            "added_at": datetime.now(timezone.utc).isoformat(),
-            "last_status_category": None,
-            "last_status": None,
-            "notified_out_for_delivery": False,
-            "notified_delivered": False,
-            "notified_problem": False,
-        }
-        _save_tracking(self.tracking_data)
-        self._update_interval()
-        return True
+            self.tracking_data[tn] = {
+                "user_id": user_id,
+                "channel_id": channel_id,
+                "message_id": message_id,
+                "added_at": datetime.now(timezone.utc).isoformat(),
+                "last_status_category": None,
+                "last_status": None,
+                "notified_out_for_delivery": False,
+                "notified_delivered": False,
+                "notified_alert": False,
+                "notified_return": False,
+                "notified_delivery_attempt": False,
+                "notified_pickup": False,
+            }
+            _save_tracking(self.tracking_data)
+            self._update_interval()
+            return True
 
     def remove(self, tracking_number: str) -> bool:
         tn = tracking_number.strip().upper()
@@ -486,6 +495,28 @@ class TrackingMonitor:
 
     @tasks.loop(minutes=BASE_POLL_MINUTES)
     async def _poll_loop(self):
+        if not self.tracking_data:
+            return
+
+        # Remove stale packages that have been tracked too long
+        now = datetime.now(timezone.utc)
+        stale = []
+        for tn, entry in self.tracking_data.items():
+            added_at = entry.get("added_at")
+            if not added_at:
+                continue
+            try:
+                added_dt = datetime.fromisoformat(added_at)
+                if (now - added_dt).days > MAX_TRACKING_DAYS:
+                    stale.append(tn)
+            except (ValueError, TypeError):
+                continue
+        for tn in stale:
+            del self.tracking_data[tn]
+            logger.info("Auto-removed stale package %s (older than %d days)", tn, MAX_TRACKING_DAYS)
+        if stale:
+            _save_tracking(self.tracking_data)
+
         if not self.tracking_data:
             return
 
@@ -535,7 +566,6 @@ class TrackingMonitor:
 
             # Small delay between batches to be polite to the API
             if batch_start + BATCH_SIZE < len(tracking_numbers):
-                import asyncio
                 await asyncio.sleep(2)
 
     @_poll_loop.before_loop
@@ -552,21 +582,18 @@ class TrackingMonitor:
         flag_map = {
             "Out for Delivery": "notified_out_for_delivery",
             "Delivered": "notified_delivered",
+            "Alert": "notified_alert",
+            "Return to Sender": "notified_return",
+            "Delivery Attempt": "notified_delivery_attempt",
+            "Available for Pickup": "notified_pickup",
         }
-        # Problem categories share one flag
-        problem_cats = {"Alert", "Return to Sender", "Delivery Attempt", "Available for Pickup"}
 
-        if category in flag_map:
-            flag = flag_map[category]
-        elif category in problem_cats:
-            flag = "notified_problem"
-        else:
+        flag = flag_map.get(category)
+        if not flag:
             return
 
         if entry.get(flag):
             return  # Already notified
-
-        entry[flag] = True
 
         try:
             owner = await self.bot.fetch_user(OWNER_ID)
@@ -575,9 +602,14 @@ class TrackingMonitor:
             logger.info("DM sent for %s → %s", tn, category)
         except Exception as exc:
             logger.error("Failed to DM owner for %s: %s", tn, exc)
+            return  # Don't mark as notified if DM failed
 
-        # Auto-remove terminal packages
+        entry[flag] = True
+
+        # Auto-remove terminal packages (update embed one last time first)
         if category in TERMINAL_CATEGORIES:
+            if entry.get("channel_id") and entry.get("message_id"):
+                await self._update_channel_embed(tn, entry, result)
             del self.tracking_data[tn]
             logger.info("Auto-removed delivered package %s", tn)
 
@@ -599,11 +631,11 @@ class TrackingMonitor:
                 tn, result, entry.get("user_id"), show_history=True, logo_url=USPS_LOGO_URL,
             )
             await message.edit(embed=embed)
-        except discord.NotFound:
-            # Message was deleted — switch to DM-only mode
+        except (discord.NotFound, discord.Forbidden):
+            # Channel or message was deleted/inaccessible — stop trying
             entry["channel_id"] = None
             entry["message_id"] = None
-            logger.warning("Tracking message deleted for %s, switching to DM mode", tn)
+            logger.warning("Channel/message gone for %s, stopping embed updates", tn)
         except Exception as exc:
             logger.error("Failed to update channel embed for %s: %s", tn, exc)
 
