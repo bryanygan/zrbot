@@ -267,6 +267,29 @@ async def on_interaction(interaction: discord.Interaction):
         if info:
             await interaction.response.send_message(info["value"], ephemeral=True)
 
+    # -- Tracking list pagination --
+    elif custom_id.startswith("tl_prev_") or custom_id.startswith("tl_next_"):
+        monitor = getattr(bot, "tracking_monitor", None)
+        if not monitor or not monitor.tracking_data:
+            return await interaction.response.send_message("No packages to display.", ephemeral=True)
+
+        from commands.tracking import _build_tracking_lines, _build_trackinglist_embed, _build_trackinglist_view, PACKAGES_PER_PAGE
+
+        current_page = int(custom_id.split("_")[-1])
+        if custom_id.startswith("tl_prev_"):
+            page = max(0, current_page - 1)
+        else:
+            page = current_page + 1
+
+        data = monitor.list_all()
+        lines = _build_tracking_lines(data)
+        total_pages = max(1, (len(lines) + PACKAGES_PER_PAGE - 1) // PACKAGES_PER_PAGE)
+        page = min(page, total_pages - 1)
+
+        embed = _build_trackinglist_embed(lines, page, total_pages, len(data), monitor._poll_interval_minutes)
+        view = _build_trackinglist_view(page, total_pages)
+        await interaction.response.edit_message(embed=embed, view=view)
+
     # -- Tracking embed buttons --
     elif custom_id.startswith("tracking_details_"):
         tn = custom_id.removeprefix("tracking_details_")
@@ -371,8 +394,16 @@ async def on_interaction(interaction: discord.Interaction):
         entry["message_id"] = None
         _save_tracking(monitor.tracking_data)
 
+        reenable_view = discord.ui.View(timeout=None)
+        reenable_view.add_item(discord.ui.Button(
+            custom_id=f"tracking_live_{tn}",
+            label="Re-enable Live Updates",
+            style=discord.ButtonStyle.primary,
+            emoji="\U0001f514",
+        ))
         await interaction.response.send_message(
             "\U0001f515 Live updates stopped. The tracking message in your DMs will no longer update.",
+            view=reenable_view,
             ephemeral=True,
         )
         await _log_to_channel(bot, f"\U0001f515 **{interaction.user}** stopped live updates for `{tn}`")

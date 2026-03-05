@@ -133,6 +133,66 @@ def setup(bot: commands.Bot):
                 f"`{tn}` is not being tracked.", ephemeral=True
             )
 
+    PACKAGES_PER_PAGE = 8
+
+    def _build_tracking_lines(data: dict) -> list[str]:
+        from utils.tracking_monitor import STATUS_CONFIG, DEFAULT_STATUS_CONFIG, HIGH_PRIORITY_CATEGORIES, LOW_PRIORITY_CATEGORIES
+
+        lines = []
+        for tn, entry in data.items():
+            cat = entry.get("last_status_category") or "Unknown"
+            _, emoji, label = STATUS_CONFIG.get(cat, DEFAULT_STATUS_CONFIG)
+            mode = "channel" if entry.get("channel_id") else "DM"
+            user_mention = f"<@{entry['user_id']}>" if entry.get("user_id") else "Unknown"
+
+            checked_at = entry.get("last_checked_at")
+            checked_str = ""
+            if checked_at:
+                try:
+                    checked_ts = int(datetime.fromisoformat(checked_at).timestamp())
+                    checked_str = f" \u2022 <t:{checked_ts}:R>"
+                except (ValueError, TypeError):
+                    pass
+
+            tier = ""
+            if cat in HIGH_PRIORITY_CATEGORIES:
+                tier = " \U0001f525"
+            elif cat in LOW_PRIORITY_CATEGORIES:
+                tier = " \U0001f535"
+
+            pkg_label = entry.get("label")
+            name_part = f"**{pkg_label}** (`{tn}`)" if pkg_label else f"`{tn}`"
+            lines.append(f"{emoji} {name_part} \u2014 {label} \u2014 {user_mention} ({mode}){checked_str}{tier}")
+        return lines
+
+    def _build_trackinglist_embed(lines: list[str], page: int, total_pages: int, total: int, poll_min: int) -> discord.Embed:
+        start = page * PACKAGES_PER_PAGE
+        page_lines = lines[start:start + PACKAGES_PER_PAGE]
+        embed = discord.Embed(
+            title=f"\U0001f4e6 Tracked Packages ({total})",
+            description="\n".join(page_lines),
+            color=0x5865F2,
+        )
+        footer = f"Page {page + 1}/{total_pages} \u2022 Polling every {poll_min} min"
+        embed.set_footer(text=footer)
+        return embed
+
+    def _build_trackinglist_view(page: int, total_pages: int) -> discord.ui.View:
+        view = discord.ui.View(timeout=None)
+        view.add_item(discord.ui.Button(
+            custom_id=f"tl_prev_{page}",
+            label="Previous",
+            style=discord.ButtonStyle.secondary,
+            disabled=page == 0,
+        ))
+        view.add_item(discord.ui.Button(
+            custom_id=f"tl_next_{page}",
+            label="Next",
+            style=discord.ButtonStyle.secondary,
+            disabled=page >= total_pages - 1,
+        ))
+        return view
+
     @bot.tree.command(name="trackinglist", description="Show all tracked packages")
     @app_commands.allowed_installs(guilds=True, users=True)
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
@@ -154,49 +214,16 @@ def setup(bot: commands.Bot):
                 "No packages are currently being tracked.", ephemeral=True
             )
 
-        from utils.tracking_monitor import STATUS_CONFIG, DEFAULT_STATUS_CONFIG, HIGH_PRIORITY_CATEGORIES, LOW_PRIORITY_CATEGORIES
+        lines = _build_tracking_lines(data)
+        total_pages = max(1, (len(lines) + PACKAGES_PER_PAGE - 1) // PACKAGES_PER_PAGE)
 
-        lines = []
-        for tn, entry in data.items():
-            cat = entry.get("last_status_category") or "Unknown"
-            _, emoji, label = STATUS_CONFIG.get(cat, DEFAULT_STATUS_CONFIG)
-            mode = "channel" if entry.get("channel_id") else "DM"
-            user_mention = f"<@{entry['user_id']}>"
+        embed = _build_trackinglist_embed(lines, 0, total_pages, len(data), monitor._poll_interval_minutes)
 
-            # Last checked relative timestamp
-            checked_at = entry.get("last_checked_at")
-            checked_str = ""
-            if checked_at:
-                from datetime import datetime, timezone
-                try:
-                    checked_ts = int(datetime.fromisoformat(checked_at).timestamp())
-                    checked_str = f" \u2022 <t:{checked_ts}:R>"
-                except (ValueError, TypeError):
-                    pass
-
-            # Priority tier indicator
-            tier = ""
-            if cat in HIGH_PRIORITY_CATEGORIES:
-                tier = " \U0001f525"  # fire = high priority
-            elif cat in LOW_PRIORITY_CATEGORIES:
-                tier = " \U0001f535"  # blue circle = low priority
-
-            pkg_label = entry.get("label")
-            name_part = f"**{pkg_label}** (`{tn}`)" if pkg_label else f"`{tn}`"
-            lines.append(f"{emoji} {name_part} \u2014 {label} \u2014 {user_mention} ({mode}){checked_str}{tier}")
-
-        description = "\n".join(lines)
-        # Discord embed description limit is 4096 chars
-        if len(description) > 4096:
-            description = description[:4090] + "\n..."
-
-        embed = discord.Embed(
-            title=f"\U0001f4e6 Tracked Packages ({len(data)})",
-            description=description,
-            color=0x5865F2,
-        )
-        embed.set_footer(text=f"Polling every {monitor._poll_interval_minutes} min")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        if total_pages <= 1:
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        else:
+            view = _build_trackinglist_view(0, total_pages)
+            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
     @bot.tree.command(name="trackrefresh", description="Force refresh all tracked packages now")
     @app_commands.allowed_installs(guilds=True, users=True)
