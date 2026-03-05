@@ -327,13 +327,55 @@ async def on_interaction(interaction: discord.Interaction):
             entry["message_id"] = dm_msg.id
             _save_tracking(monitor.tracking_data)
             bot.add_view(build_tracking_view(tn, delivered=is_delivered))
-            await interaction.followup.send("Live tracking updates will be sent to your DMs!", ephemeral=True)
+
+            confirm_embed = discord.Embed(
+                title="\U0001f514 Live Updates Enabled",
+                description=(
+                    "You'll receive a tracking embed in your DMs that **automatically updates** "
+                    "as your package moves through USPS. The message will edit itself with the "
+                    "latest status, location, and estimated delivery.\n\n"
+                    "You don't need to do anything — just check back on the message anytime!\n\n"
+                    "If you'd like to **stop receiving updates**, click the button below."
+                ),
+                color=0x5865F2,
+            )
+            stop_view = discord.ui.View(timeout=None)
+            stop_view.add_item(discord.ui.Button(
+                custom_id=f"tracking_stoplive_{tn}",
+                label="Stop Live Updates",
+                style=discord.ButtonStyle.danger,
+                emoji="\U0001f515",
+            ))
+            await interaction.followup.send(embed=confirm_embed, view=stop_view, ephemeral=True)
             await _log_to_channel(bot, f"\U0001f514 **{interaction.user}** opted in to live updates for `{tn}`")
         except discord.Forbidden:
             await interaction.followup.send(
                 "I can't DM you! To get live updates, **add the app** by clicking on my profile and selecting **\"Add App\"**, then try again.",
                 ephemeral=True,
             )
+
+    elif custom_id.startswith("tracking_stoplive_"):
+        tn = custom_id.removeprefix("tracking_stoplive_")
+        monitor = getattr(bot, "tracking_monitor", None)
+        if not monitor:
+            return await interaction.response.send_message("Tracking monitor is not configured.", ephemeral=True)
+
+        entry = monitor.tracking_data.get(tn)
+        if not entry:
+            return await interaction.response.send_message(f"`{tn}` is no longer being tracked.", ephemeral=True)
+
+        from utils.tracking_monitor import _save_tracking, _log_to_channel
+
+        # Clear the bot DM channel/message so the bot stops editing
+        entry["channel_id"] = None
+        entry["message_id"] = None
+        _save_tracking(monitor.tracking_data)
+
+        await interaction.response.send_message(
+            "\U0001f515 Live updates stopped. The tracking message in your DMs will no longer update.",
+            ephemeral=True,
+        )
+        await _log_to_channel(bot, f"\U0001f515 **{interaction.user}** stopped live updates for `{tn}`")
 
     elif custom_id.startswith("tracking_confirm_"):
         tn = custom_id.removeprefix("tracking_confirm_")
