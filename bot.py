@@ -330,7 +330,10 @@ async def on_interaction(interaction: discord.Interaction):
             await interaction.followup.send("Live tracking updates will be sent to your DMs!", ephemeral=True)
             await _log_to_channel(bot, f"\U0001f514 **{interaction.user}** opted in to live updates for `{tn}`")
         except discord.Forbidden:
-            await interaction.followup.send("I can't DM you. Please enable DMs from server members or add me as a friend.", ephemeral=True)
+            await interaction.followup.send(
+                "I can't DM you! To get live updates, **add the app** by clicking on my profile and selecting **\"Add App\"**, then try again.",
+                ephemeral=True,
+            )
 
     elif custom_id.startswith("tracking_confirm_"):
         tn = custom_id.removeprefix("tracking_confirm_")
