@@ -38,7 +38,7 @@ MAX_TRACKING_DAYS = 60  # Auto-remove packages older than this
 HIGH_PRIORITY_CATEGORIES = {"Out for Delivery", "Delivery Attempt", "Available for Pickup"}
 
 # Packages with no movement — polled less frequently
-LOW_PRIORITY_CATEGORIES = {"Pre-Shipment", "Shipping Label Created", "USPS Awaiting Item"}
+LOW_PRIORITY_CATEGORIES = {"Pre-Shipment", "Shipping Label Created", "USPS Awaiting Item", "Waiting for USPS"}
 LOW_PRIORITY_POLL_MINUTES = 60
 
 # USPS logo thumbnail — swap between the two logos here:
@@ -59,6 +59,7 @@ STATUS_CONFIG = {
     "Delivery Attempt":    (0xE67E22, "\U0001f4cb", "Delivery Attempted"),  # orange, 📋
     "Available for Pickup":(0xE67E22, "\U0001f4ee", "Ready for Pickup"),    # orange, 📮
     "Pre-Shipment":        (0x95A5A6, "\U0001f4dd", "Pre-Shipment"),       # gray, 📝
+    "Waiting for USPS":    (0x95A5A6, "\u23f3", "Waiting for USPS"),     # gray, ⏳
 }
 
 DEFAULT_STATUS_CONFIG = (0x95A5A6, "\U0001f4e6", "Unknown Status")  # gray, 📦
@@ -220,6 +221,7 @@ _PROGRESS_CATEGORY_MAP = {
     "Pre-Shipment": 0,
     "Shipping Label Created": 0,
     "USPS Awaiting Item": 0,
+    "Waiting for USPS": 0,
     "On the Way": 1,
     "In Transit": 1,
     "International Transit": 1,
@@ -322,7 +324,7 @@ def build_tracking_embed(
     user_id: int | None = None,
     *,
     show_history: bool = True,
-    max_events: int = 6,
+    max_events: int = 2,
     logo_url: str | None = None,
 ) -> discord.Embed:
     """Build a rich embed for a tracking update."""
@@ -445,6 +447,22 @@ def build_tracking_embed(
         )
 
     embed.set_footer(text="USPS Tracking \u2022 Last checked")
+
+    # Discord embed limit is 6000 chars total — trim history if over
+    total = len(embed.title or "") + len(embed.description or "")
+    total += sum(len(f.name) + len(f.value) for f in embed.fields)
+    total += len(embed.footer.text or "") if embed.footer else 0
+    if total > 5900:
+        # Remove tracking history field(s) and add a link instead
+        embed.remove_field(next(
+            (i for i, f in enumerate(embed.fields) if f.name == "Tracking History"), -1
+        ))
+        embed.add_field(
+            name="Tracking History",
+            value=f"[View full history on USPS]({USPS_TRACKING_PAGE}{tracking_number})",
+            inline=False,
+        )
+
     return embed
 
 

@@ -15,12 +15,12 @@ def setup(bot: commands.Bot):
     @bot.tree.command(name="track", description="Start tracking a USPS package")
     @app_commands.describe(
         tracking_number="USPS tracking number",
-        user="The Discord user this package is for",
+        user="The Discord user this package is for (auto-detected in DMs)",
     )
     async def track_command(
         interaction: discord.Interaction,
         tracking_number: str,
-        user: discord.User,
+        user: discord.User = None,
     ):
         if not _is_authorized(interaction):
             return await interaction.response.send_message(
@@ -34,6 +34,15 @@ def setup(bot: commands.Bot):
                 ephemeral=True,
             )
 
+        # Resolve recipient: explicit user > DM recipient > None
+        if user is None and interaction.guild is None:
+            # In a DM — the other participant is the recipient
+            channel = interaction.channel
+            if hasattr(channel, "recipient") and channel.recipient:
+                user = channel.recipient
+
+        user_id = user.id if user else None
+
         tn = tracking_number.strip().upper()
 
         if tn in monitor.tracking_data:
@@ -45,23 +54,23 @@ def setup(bot: commands.Bot):
 
         result = await monitor.check_single(tn)
 
-        if not result or "error" in result or result.get("statusCode") == "404":
-            error_detail = ""
-            if result and "error" in result:
-                errs = result["error"].get("errors", [])
-                if errs:
-                    error_detail = f"\n{errs[0].get('detail', '')}"
-            return await interaction.followup.send(
-                f"Could not find tracking info for `{tn}`.{error_detail}",
-                ephemeral=True,
-            )
-
         from utils.tracking_monitor import build_tracking_embed, build_tracking_view, _save_tracking, USPS_LOGO_URL
 
-        embed = build_tracking_embed(tn, result, user.id, logo_url=USPS_LOGO_URL)
+        usps_not_found = not result or "error" in result or result.get("statusCode") == "404"
+
+        if usps_not_found:
+            # USPS doesn't know about this number yet — accept it with a pending status
+            result = {
+                "statusCategory": "Waiting for USPS",
+                "status": "Waiting for USPS",
+                "statusSummary": "Label has been created but USPS hasn't registered this package yet. It will update automatically once USPS scans it.",
+                "trackingEvents": [],
+            }
+
+        embed = build_tracking_embed(tn, result, user_id, logo_url=USPS_LOGO_URL)
         view = build_tracking_view(tn)
         msg = await interaction.followup.send(embed=embed, view=view, wait=True)
-        await monitor.add(tn, user.id, channel_id=msg.channel.id, message_id=msg.id)
+        await monitor.add(tn, user_id, channel_id=msg.channel.id, message_id=msg.id)
 
         entry = monitor.tracking_data[tn]
         entry["last_status_category"] = result.get("statusCategory")

@@ -286,7 +286,7 @@ async def on_interaction(interaction: discord.Interaction):
 
     elif custom_id.startswith("tracking_copy_"):
         tn = custom_id.removeprefix("tracking_copy_")
-        await interaction.response.send_message(f"`{tn}`", ephemeral=True)
+        await interaction.response.send_message(tn)
 
 
 # ---------------------------------------------------------------------------
