@@ -31,7 +31,15 @@ BATCH_SIZE = 35  # USPS max per request
 BASE_POLL_MINUTES = 30
 MIN_POLL_MINUTES = 15
 MAX_POLL_MINUTES = 60
+PRIORITY_POLL_MINUTES = 10  # Faster polling for high-priority packages
 MAX_TRACKING_DAYS = 60  # Auto-remove packages older than this
+
+# Packages near final delivery — polled more frequently
+HIGH_PRIORITY_CATEGORIES = {"Out for Delivery", "Delivery Attempt", "Available for Pickup"}
+
+# Packages with no movement — polled less frequently
+LOW_PRIORITY_CATEGORIES = {"Pre-Shipment", "Shipping Label Created", "USPS Awaiting Item"}
+LOW_PRIORITY_POLL_MINUTES = 60
 
 # USPS logo thumbnail — swap between the two logos here:
 # "USPS-Logo.png" (icon only) or "USPS_Logo_Text.webp" (icon + text)
@@ -260,6 +268,54 @@ def _calculate_days_in_transit(events: list[dict]) -> int | None:
     return max(0, delta.days)
 
 
+def _build_eta_countdown(delivery_info: dict, category: str) -> str:
+    """Build an ETA countdown string (Windows-safe, no %-d)."""
+    if category in TERMINAL_CATEGORIES:
+        return ""
+    exp_date = delivery_info.get("expectedDeliveryDate") or delivery_info.get("predictedDeliveryDate")
+    if not exp_date:
+        return ""
+    try:
+        dt = datetime.strptime(exp_date, "%Y-%m-%d")
+        today = datetime.now().date()
+        days_until = (dt.date() - today).days
+        if days_until < 0:
+            return "\u26a0\ufe0f **Past expected delivery**"
+        elif days_until == 0:
+            return "\U0001f389 **Arriving today!**"
+        elif days_until == 1:
+            return "\U0001f4e8 **Arriving tomorrow!**"
+        elif days_until <= 3:
+            return f"\U0001f4e6 **{days_until} days away**"
+    except ValueError:
+        pass
+    return ""
+
+
+def build_tracking_view(tracking_number: str) -> discord.ui.View:
+    """Build a persistent button row for a tracking embed."""
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(
+        label="Track on USPS",
+        style=discord.ButtonStyle.link,
+        url=f"{USPS_TRACKING_PAGE}{tracking_number}",
+        emoji="\U0001f517",
+    ))
+    view.add_item(discord.ui.Button(
+        custom_id=f"tracking_details_{tracking_number}",
+        label="Show Details",
+        style=discord.ButtonStyle.secondary,
+        emoji="\U0001f4cb",
+    ))
+    view.add_item(discord.ui.Button(
+        custom_id=f"tracking_copy_{tracking_number}",
+        label="Copy #",
+        style=discord.ButtonStyle.secondary,
+        emoji="\U0001f4ce",
+    ))
+    return view
+
+
 def build_tracking_embed(
     tracking_number: str,
     data: dict,
@@ -318,16 +374,18 @@ def build_tracking_embed(
         route = f"{origin or 'Unknown'} \u2192 {dest or 'Unknown'}"
         embed.add_field(name="Route", value=route, inline=True)
 
-    # Expected delivery date + window
+    # Expected delivery date + window + countdown
     exp_date = delivery_info.get("expectedDeliveryDate") or delivery_info.get("predictedDeliveryDate")
     if exp_date and category not in TERMINAL_CATEGORIES:
         try:
             dt = datetime.strptime(exp_date, "%Y-%m-%d")
             delivery_text = f"<t:{int(dt.timestamp())}:D>"
-            # Check for delivery time window
             delivery_time = delivery_info.get("expectedDeliveryTime") or delivery_info.get("predictedDeliveryEndTime") or ""
             if delivery_time:
                 delivery_text += f"\nby {delivery_time}"
+            countdown = _build_eta_countdown(delivery_info, category)
+            if countdown:
+                delivery_text += f"\n{countdown}"
             embed.add_field(name="Expected Delivery", value=delivery_text, inline=True)
         except ValueError:
             embed.add_field(name="Expected Delivery", value=exp_date, inline=True)
@@ -403,7 +461,29 @@ class TrackingMonitor:
         self.consumer_secret = consumer_secret
         self.tracking_data = _load_tracking()
         self._lock = asyncio.Lock()
+        self._last_full_poll: float = 0
+        self._last_low_poll: float = 0
+        self._last_error_dm: float = 0
         self._poll_loop.change_interval(minutes=BASE_POLL_MINUTES)
+
+    async def _dm_owner_error(self, title: str, detail: str):
+        """Send an error notification DM to the bot owner (rate-limited)."""
+        now = time.time()
+        if now - self._last_error_dm < 10:
+            return
+        try:
+            owner = await self.bot.fetch_user(OWNER_ID)
+            embed = discord.Embed(
+                title=f"\u26a0\ufe0f {title}",
+                description=detail[:4000],
+                color=0xED4245,
+                timestamp=datetime.now(timezone.utc),
+            )
+            embed.set_footer(text="ZR Bot Error Notification")
+            await owner.send(embed=embed)
+            self._last_error_dm = now
+        except Exception as exc:
+            logger.error("Failed to DM owner about error: %s", exc)
 
     def start(self):
         if not self._poll_loop.is_running():
@@ -415,7 +495,14 @@ class TrackingMonitor:
             self._poll_loop.cancel()
 
     @property
-    def _poll_interval_minutes(self) -> int:
+    def _has_priority_packages(self) -> bool:
+        return any(
+            entry.get("last_status_category") in HIGH_PRIORITY_CATEGORIES
+            for entry in self.tracking_data.values()
+        )
+
+    @property
+    def _normal_poll_interval_minutes(self) -> int:
         count = len(self.tracking_data)
         if count == 0:
             return MAX_POLL_MINUTES
@@ -424,6 +511,12 @@ class TrackingMonitor:
         if count <= 70:
             return 20
         return MIN_POLL_MINUTES
+
+    @property
+    def _poll_interval_minutes(self) -> int:
+        if self._has_priority_packages:
+            return PRIORITY_POLL_MINUTES
+        return self._normal_poll_interval_minutes
 
     def _update_interval(self):
         new_interval = self._poll_interval_minutes
@@ -520,8 +613,42 @@ class TrackingMonitor:
         if not self.tracking_data:
             return
 
-        tracking_numbers = list(self.tracking_data.keys())
-        logger.info("Polling %d tracked packages...", len(tracking_numbers))
+        # Separate packages into priority tiers
+        priority_numbers = []
+        normal_numbers = []
+        low_priority_numbers = []
+        for tn, entry in self.tracking_data.items():
+            cat = entry.get("last_status_category")
+            if cat in HIGH_PRIORITY_CATEGORIES:
+                priority_numbers.append(tn)
+            elif cat in LOW_PRIORITY_CATEGORIES:
+                low_priority_numbers.append(tn)
+            else:
+                normal_numbers.append(tn)
+
+        # Determine which tiers to poll this cycle
+        now_ts = time.time()
+        full_interval_secs = self._normal_poll_interval_minutes * 60
+        due_for_full_poll = (now_ts - self._last_full_poll) >= full_interval_secs
+        low_interval_secs = LOW_PRIORITY_POLL_MINUTES * 60
+        due_for_low_poll = (now_ts - self._last_low_poll) >= low_interval_secs
+
+        if due_for_full_poll:
+            tracking_numbers = priority_numbers + normal_numbers
+            if due_for_low_poll:
+                tracking_numbers += low_priority_numbers
+                self._last_low_poll = now_ts
+            self._last_full_poll = now_ts
+        else:
+            tracking_numbers = priority_numbers
+
+        if not tracking_numbers:
+            return
+
+        logger.info("Polling %d packages (%d priority, %d normal, %d low-priority)...",
+                     len(tracking_numbers), len(priority_numbers),
+                     len(normal_numbers) if due_for_full_poll else 0,
+                     len(low_priority_numbers) if due_for_low_poll else 0)
 
         # Process in batches of 35
         for batch_start in range(0, len(tracking_numbers), BATCH_SIZE):
@@ -532,9 +659,18 @@ class TrackingMonitor:
                 )
             except RateLimitError as e:
                 logger.warning("Rate limited, skipping remaining batches. Retry in %ds", e.retry_after)
+                await self._dm_owner_error(
+                    "USPS Rate Limited",
+                    f"Rate limited by USPS API. Retry after **{e.retry_after}s**.\n"
+                    f"Skipped remaining batches ({len(tracking_numbers) - batch_start} packages unpolled).",
+                )
                 return
             except Exception as exc:
                 logger.error("Batch fetch error: %s", exc)
+                await self._dm_owner_error(
+                    "USPS API Error",
+                    f"Batch fetch failed for {len(batch)} packages:\n```{exc}```",
+                )
                 continue
 
             for result in results:
@@ -553,6 +689,7 @@ class TrackingMonitor:
                 # Update stored status
                 entry["last_status_category"] = new_category
                 entry["last_status"] = result.get("status", "")
+                entry["last_checked_at"] = datetime.now(timezone.utc).isoformat()
 
                 # -- In-channel mode: edit the embed message --
                 if entry.get("channel_id") and entry.get("message_id"):
@@ -568,9 +705,23 @@ class TrackingMonitor:
             if batch_start + BATCH_SIZE < len(tracking_numbers):
                 await asyncio.sleep(2)
 
+        # Re-evaluate loop speed in case packages gained/lost priority
+        self._update_interval()
+
     @_poll_loop.before_loop
     async def _before_poll(self):
         await self.bot.wait_until_ready()
+
+    @_poll_loop.error
+    async def _poll_loop_error(self, error: Exception):
+        """Handle unhandled errors in the poll loop."""
+        import traceback
+        tb = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+        logger.error("Poll loop crashed:\n%s", tb)
+        await self._dm_owner_error(
+            "Tracking Poll Loop Crashed",
+            f"The background polling loop encountered an error:\n```{tb[:3800]}```",
+        )
 
     # -- Notification helpers --
 
@@ -598,7 +749,8 @@ class TrackingMonitor:
         try:
             owner = await self.bot.fetch_user(OWNER_ID)
             embed = build_tracking_embed(tn, result, entry.get("user_id"), logo_url=USPS_LOGO_URL)
-            await owner.send(embed=embed)
+            view = build_tracking_view(tn)
+            await owner.send(embed=embed, view=view)
             logger.info("DM sent for %s → %s", tn, category)
         except Exception as exc:
             logger.error("Failed to DM owner for %s: %s", tn, exc)
@@ -630,7 +782,8 @@ class TrackingMonitor:
             embed = build_tracking_embed(
                 tn, result, entry.get("user_id"), show_history=True, logo_url=USPS_LOGO_URL,
             )
-            await message.edit(embed=embed)
+            view = build_tracking_view(tn)
+            await message.edit(embed=embed, view=view)
         except (discord.NotFound, discord.Forbidden):
             # Channel or message was deleted/inaccessible — stop trying
             entry["channel_id"] = None
@@ -641,4 +794,6 @@ class TrackingMonitor:
 
     async def force_poll(self):
         """Manually trigger a poll cycle (for the /trackrefresh command)."""
+        self._last_full_poll = 0
+        self._last_low_poll = 0
         await self._poll_loop.coro(self)

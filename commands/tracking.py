@@ -56,10 +56,11 @@ def setup(bot: commands.Bot):
                 ephemeral=True,
             )
 
-        from utils.tracking_monitor import build_tracking_embed, _save_tracking, USPS_LOGO_URL
+        from utils.tracking_monitor import build_tracking_embed, build_tracking_view, _save_tracking, USPS_LOGO_URL
 
         embed = build_tracking_embed(tn, result, user.id, logo_url=USPS_LOGO_URL)
-        msg = await interaction.followup.send(embed=embed, wait=True)
+        view = build_tracking_view(tn)
+        msg = await interaction.followup.send(embed=embed, view=view, wait=True)
         await monitor.add(tn, user.id, channel_id=msg.channel.id, message_id=msg.id)
 
         entry = monitor.tracking_data[tn]
@@ -113,7 +114,7 @@ def setup(bot: commands.Bot):
                 "No packages are currently being tracked.", ephemeral=True
             )
 
-        from utils.tracking_monitor import STATUS_CONFIG, DEFAULT_STATUS_CONFIG
+        from utils.tracking_monitor import STATUS_CONFIG, DEFAULT_STATUS_CONFIG, HIGH_PRIORITY_CATEGORIES, LOW_PRIORITY_CATEGORIES
 
         lines = []
         for tn, entry in data.items():
@@ -121,7 +122,26 @@ def setup(bot: commands.Bot):
             _, emoji, label = STATUS_CONFIG.get(cat, DEFAULT_STATUS_CONFIG)
             mode = "channel" if entry.get("channel_id") else "DM"
             user_mention = f"<@{entry['user_id']}>"
-            lines.append(f"{emoji} `{tn}` \u2014 {label} \u2014 {user_mention} ({mode})")
+
+            # Last checked relative timestamp
+            checked_at = entry.get("last_checked_at")
+            checked_str = ""
+            if checked_at:
+                from datetime import datetime, timezone
+                try:
+                    checked_ts = int(datetime.fromisoformat(checked_at).timestamp())
+                    checked_str = f" \u2022 <t:{checked_ts}:R>"
+                except (ValueError, TypeError):
+                    pass
+
+            # Priority tier indicator
+            tier = ""
+            if cat in HIGH_PRIORITY_CATEGORIES:
+                tier = " \U0001f525"  # fire = high priority
+            elif cat in LOW_PRIORITY_CATEGORIES:
+                tier = " \U0001f535"  # blue circle = low priority
+
+            lines.append(f"{emoji} `{tn}` \u2014 {label} \u2014 {user_mention} ({mode}){checked_str}{tier}")
 
         embed = discord.Embed(
             title=f"\U0001f4e6 Tracked Packages ({len(data)})",

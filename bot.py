@@ -265,6 +265,29 @@ async def on_interaction(interaction: discord.Interaction):
         if info:
             await interaction.response.send_message(info["value"], ephemeral=True)
 
+    # -- Tracking embed buttons --
+    elif custom_id.startswith("tracking_details_"):
+        tn = custom_id.removeprefix("tracking_details_")
+        monitor = getattr(bot, "tracking_monitor", None)
+        if not monitor:
+            return await interaction.response.send_message("Tracking monitor is not configured.", ephemeral=True)
+
+        await interaction.response.defer(ephemeral=True)
+        result = await monitor.check_single(tn)
+        if not result or "error" in result:
+            return await interaction.followup.send(f"Could not fetch details for `{tn}`.", ephemeral=True)
+
+        entry = monitor.tracking_data.get(tn)
+        user_id = entry.get("user_id") if entry else None
+
+        from utils.tracking_monitor import build_tracking_embed, USPS_LOGO_URL
+        embed = build_tracking_embed(tn, result, user_id, logo_url=USPS_LOGO_URL, max_events=50)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    elif custom_id.startswith("tracking_copy_"):
+        tn = custom_id.removeprefix("tracking_copy_")
+        await interaction.response.send_message(f"`{tn}`", ephemeral=True)
+
 
 # ---------------------------------------------------------------------------
 # Register USPS command modules
@@ -286,6 +309,61 @@ else:
 
 
 # ---------------------------------------------------------------------------
+# Global error handlers — DM owner on any error
+# ---------------------------------------------------------------------------
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    """Catch all slash command errors and DM the owner."""
+    cmd_name = interaction.command.name if interaction.command else "unknown"
+    logger.error("Command error in /%s: %s", cmd_name, error)
+    try:
+        owner = await bot.fetch_user(OWNER_ID)
+        embed = discord.Embed(
+            title="\u26a0\ufe0f Slash Command Error",
+            description=(
+                f"**Command:** `/{cmd_name}`\n"
+                f"**User:** {interaction.user} (`{interaction.user.id}`)\n"
+                f"**Error:**\n```{error}```"
+            )[:4000],
+            color=0xED4245,
+            timestamp=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+        )
+        embed.set_footer(text="ZR Bot Error Notification")
+        await owner.send(embed=embed)
+    except Exception as dm_exc:
+        logger.error("Failed to DM owner about command error: %s", dm_exc)
+
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send("Something went wrong. The bot owner has been notified.", ephemeral=True)
+        else:
+            await interaction.response.send_message("Something went wrong. The bot owner has been notified.", ephemeral=True)
+    except Exception:
+        pass
+
+
+@bot.event
+async def on_error(event: str, *args, **kwargs):
+    """Catch unhandled errors in event handlers and DM the owner."""
+    import traceback
+    error_tb = traceback.format_exc()
+    logger.error("Unhandled error in event %s:\n%s", event, error_tb)
+    try:
+        owner = await bot.fetch_user(OWNER_ID)
+        embed = discord.Embed(
+            title="\u26a0\ufe0f Unhandled Bot Error",
+            description=f"**Event:** `{event}`\n```{error_tb[:3800]}```",
+            color=0xED4245,
+            timestamp=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+        )
+        embed.set_footer(text="ZR Bot Error Notification")
+        await owner.send(embed=embed)
+    except Exception as dm_exc:
+        logger.error("Failed to DM owner about event error: %s", dm_exc)
+
+
+# ---------------------------------------------------------------------------
 # Bot ready + command sync
 # ---------------------------------------------------------------------------
 
@@ -293,10 +371,13 @@ else:
 async def on_ready():
     logger.info("Logged in as %s", bot.user)
 
-    # Start tracking monitor
+    # Start tracking monitor and register persistent views for existing tracked packages
     if bot.tracking_monitor:
         bot.tracking_monitor.start()
         logger.info("USPS tracking monitor started")
+        from utils.tracking_monitor import build_tracking_view
+        for tn in bot.tracking_monitor.tracking_data:
+            bot.add_view(build_tracking_view(tn))
 
     # Sync commands to the guild and globally (global needed for DM support)
     await bot.tree.sync()
