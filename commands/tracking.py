@@ -359,8 +359,8 @@ def setup(bot: commands.Bot):
             category_counts[cat] = category_counts.get(cat, 0) + 1
 
         # Load stats file for historical data
-        from pathlib import Path
-        stats_path = Path(__file__).resolve().parent.parent / "data" / "stats.json"
+        from utils.tracking_monitor import STATS_FILE
+        stats_path = STATS_FILE
         historical = {}
         if stats_path.exists():
             try:

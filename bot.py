@@ -21,7 +21,8 @@ logger = logging.getLogger("zrbot")
 # Simple JSON file database (ported from vouch_counter_bot.js)
 # ---------------------------------------------------------------------------
 
-DATA_DIR = Path(__file__).resolve().parent / "data"
+import os as _os
+DATA_DIR = Path(_os.environ.get("DATA_PATH", Path(__file__).resolve().parent / "data"))
 VOUCHES_FILE = DATA_DIR / "vouches.json"
 
 
