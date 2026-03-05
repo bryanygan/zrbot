@@ -58,8 +58,8 @@ STATUS_CONFIG = {
     "On the Way":          (0x5865F2, "\U0001f4e6", "In Transit"),          # blurple, 📦
     "In Transit":          (0x5865F2, "\U0001f4e6", "In Transit"),
     "International Transit":(0x9B59B6, "\U0001f30d", "International Transit"),  # purple, 🌍
-    "Accepted":            (0x2ECC71, "\U0001f4e5", "Dropped Off"),        # green, 📥
-    "USPS in Possession":  (0x2ECC71, "\U0001f4e5", "Dropped Off"),        # green, 📥
+    "Accepted":            (0x2ECC71, "\U0001f4e5", "Accepted"),            # green, 📥
+    "USPS in Possession":  (0x2ECC71, "\U0001f4e5", "USPS in Possession"), # green, 📥
     "USPS Awaiting Item":  (0x95A5A6, "\U0001f3f7\ufe0f", "Awaiting Pickup"),  # gray, 🏷️
     "Shipping Label Created": (0x95A5A6, "\U0001f3f7\ufe0f", "Label Created"),
     "Alert":               (0xED4245, "\u26a0\ufe0f", "Alert"),              # red, ⚠️
