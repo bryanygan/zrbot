@@ -113,7 +113,7 @@ def setup(bot: commands.Bot):
                 "No packages are currently being tracked.", ephemeral=True
             )
 
-        from utils.tracking_monitor import STATUS_CONFIG, DEFAULT_STATUS_CONFIG
+        from utils.tracking_monitor import STATUS_CONFIG, DEFAULT_STATUS_CONFIG, LOW_PRIORITY_CATEGORIES
 
         lines = []
         for tn, entry in data.items():
@@ -121,7 +121,20 @@ def setup(bot: commands.Bot):
             _, emoji, label = STATUS_CONFIG.get(cat, DEFAULT_STATUS_CONFIG)
             mode = "channel" if entry.get("channel_id") else "DM"
             user_mention = f"<@{entry['user_id']}>"
-            lines.append(f"{emoji} `{tn}` \u2014 {label} \u2014 {user_mention} ({mode})")
+            # Show relative "last checked" timestamp
+            checked_at = entry.get("last_checked_at")
+            checked_str = ""
+            if checked_at:
+                from datetime import datetime, timezone
+                try:
+                    checked_ts = int(datetime.fromisoformat(checked_at).timestamp())
+                    checked_str = f" \u2022 <t:{checked_ts}:R>"
+                except (ValueError, TypeError):
+                    pass
+            tier = ""
+            if cat in LOW_PRIORITY_CATEGORIES:
+                tier = " \U0001f535"  # blue circle = low-priority
+            lines.append(f"{emoji} `{tn}` \u2014 {label} \u2014 {user_mention} ({mode}){checked_str}{tier}")
 
         embed = discord.Embed(
             title=f"\U0001f4e6 Tracked Packages ({len(data)})",
@@ -186,5 +199,6 @@ def setup(bot: commands.Bot):
         user_id = entry.get("user_id") if entry else None
 
         from utils.tracking_monitor import build_tracking_embed, USPS_LOGO_URL
-        embed = build_tracking_embed(tn, result, user_id, logo_url=USPS_LOGO_URL)
+        # Show full history (up to 50 events) for trackinfo lookups
+        embed = build_tracking_embed(tn, result, user_id, logo_url=USPS_LOGO_URL, max_events=50)
         await interaction.followup.send(embed=embed, ephemeral=True)

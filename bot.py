@@ -286,6 +286,63 @@ else:
 
 
 # ---------------------------------------------------------------------------
+# Global error handlers — DM owner on any error
+# ---------------------------------------------------------------------------
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    """Catch all slash command errors and DM the owner."""
+    logger.error("Command error in /%s: %s", interaction.command.name if interaction.command else "unknown", error)
+    try:
+        owner = await bot.fetch_user(OWNER_ID)
+        embed = discord.Embed(
+            title="\u26a0\ufe0f Slash Command Error",
+            description=(
+                f"**Command:** `/{interaction.command.name if interaction.command else 'unknown'}`\n"
+                f"**User:** {interaction.user} (`{interaction.user.id}`)\n"
+                f"**Error:**\n```{error}```"
+            )[:4000],
+            color=0xED4245,
+        )
+        import datetime as _dt
+        embed.timestamp = _dt.datetime.now(_dt.timezone.utc)
+        embed.set_footer(text="ZR Bot Error Notification")
+        await owner.send(embed=embed)
+    except Exception as dm_exc:
+        logger.error("Failed to DM owner about command error: %s", dm_exc)
+
+    # Still respond to the user so the interaction doesn't hang
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send("Something went wrong. The bot owner has been notified.", ephemeral=True)
+        else:
+            await interaction.response.send_message("Something went wrong. The bot owner has been notified.", ephemeral=True)
+    except Exception:
+        pass
+
+
+@bot.event
+async def on_error(event: str, *args, **kwargs):
+    """Catch unhandled errors in event handlers and DM the owner."""
+    import traceback
+    error_tb = traceback.format_exc()
+    logger.error("Unhandled error in event %s:\n%s", event, error_tb)
+    try:
+        owner = await bot.fetch_user(OWNER_ID)
+        embed = discord.Embed(
+            title="\u26a0\ufe0f Unhandled Bot Error",
+            description=f"**Event:** `{event}`\n```{error_tb[-3800:]}```" if len(error_tb) > 3800 else f"**Event:** `{event}`\n```{error_tb}```",
+            color=0xED4245,
+        )
+        import datetime as _dt
+        embed.timestamp = _dt.datetime.now(_dt.timezone.utc)
+        embed.set_footer(text="ZR Bot Error Notification")
+        await owner.send(embed=embed)
+    except Exception as dm_exc:
+        logger.error("Failed to DM owner about event error: %s", dm_exc)
+
+
+# ---------------------------------------------------------------------------
 # Bot ready + command sync
 # ---------------------------------------------------------------------------
 

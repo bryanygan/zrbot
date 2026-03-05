@@ -37,6 +37,10 @@ MAX_TRACKING_DAYS = 60  # Auto-remove packages older than this
 # Statuses near final delivery — these packages get polled more frequently
 HIGH_PRIORITY_CATEGORIES = {"Out for Delivery", "Delivery Attempt", "Available for Pickup"}
 
+# Statuses with no movement — these packages get polled less frequently
+LOW_PRIORITY_CATEGORIES = {"Pre-Shipment", "Shipping Label Created", "USPS Awaiting Item"}
+LOW_PRIORITY_POLL_MINUTES = 60  # Deprioritized polling for stale/label-only packages
+
 # USPS logo thumbnail — swap between the two logos here:
 # "USPS-Logo.png" (icon only) or "USPS_Logo_Text.webp" (icon + text)
 USPS_LOGO_URL = "https://raw.githubusercontent.com/bryanygan/zrbot/main/assets/USPS_Logo_Text.webp"
@@ -322,16 +326,33 @@ def build_tracking_embed(
         route = f"{origin or 'Unknown'} \u2192 {dest or 'Unknown'}"
         embed.add_field(name="Route", value=route, inline=True)
 
-    # Expected delivery date + window
+    # Expected delivery date + window with countdown
     exp_date = delivery_info.get("expectedDeliveryDate") or delivery_info.get("predictedDeliveryDate")
     if exp_date and category not in TERMINAL_CATEGORIES:
         try:
             dt = datetime.strptime(exp_date, "%Y-%m-%d")
+            today = datetime.now().date()
+            days_until = (dt.date() - today).days
+
+            # Build prominent countdown label
+            if days_until < 0:
+                countdown = "\u26a0\ufe0f **Past expected delivery**"
+            elif days_until == 0:
+                countdown = "\U0001f389 **Arriving today!**"
+            elif days_until == 1:
+                countdown = "\U0001f4e8 **Arriving tomorrow!**"
+            elif days_until <= 3:
+                countdown = f"\U0001f4e6 **{days_until} days away**"
+            else:
+                countdown = ""
+
             delivery_text = f"<t:{int(dt.timestamp())}:D>"
             # Check for delivery time window
             delivery_time = delivery_info.get("expectedDeliveryTime") or delivery_info.get("predictedDeliveryEndTime") or ""
             if delivery_time:
                 delivery_text += f"\nby {delivery_time}"
+            if countdown:
+                delivery_text += f"\n{countdown}"
             embed.add_field(name="Expected Delivery", value=delivery_text, inline=True)
         except ValueError:
             embed.add_field(name="Expected Delivery", value=exp_date, inline=True)
@@ -360,26 +381,30 @@ def build_tracking_embed(
             else:
                 history_lines.append(f"{ev_type} \u2014 {ev_loc}")
 
-        # Split into chunks if too long for one field (1024 char limit)
-        history_text = "\n\n".join(history_lines)
-        if len(history_text) <= 1024:
+        # Split into multiple fields if needed (1024 char limit per field)
+        chunks = []
+        current_chunk = []
+        current_len = 0
+        for line in history_lines:
+            line_len = len(line) + 2  # account for \n\n separator
+            if current_len + line_len > 1000 and current_chunk:
+                chunks.append("\n\n".join(current_chunk))
+                current_chunk = []
+                current_len = 0
+            current_chunk.append(line)
+            current_len += line_len
+        if current_chunk:
+            chunks.append("\n\n".join(current_chunk))
+
+        remaining = len(events) - len(history_lines)
+        # Discord embeds have a max of 25 fields; cap history to a few fields
+        for i, chunk in enumerate(chunks[:4]):
+            field_name = "Tracking History" if i == 0 else f"History (cont'd {i + 1})"
+            embed.add_field(name=field_name, value=chunk, inline=False)
+        if remaining > 0:
             embed.add_field(
-                name="Tracking History",
-                value=history_text,
-                inline=False,
-            )
-        else:
-            # Truncate to fit
-            truncated = []
-            total = 0
-            for line in history_lines:
-                if total + len(line) + 2 > 1000:
-                    break
-                truncated.append(line)
-                total += len(line) + 2
-            embed.add_field(
-                name="Tracking History",
-                value="\n\n".join(truncated) + f"\n*...and {len(events) - len(truncated)} more events*",
+                name="",
+                value=f"*...and {remaining} more events — [view full history on USPS]({USPS_TRACKING_PAGE}{tracking_number})*",
                 inline=False,
             )
 
@@ -408,7 +433,30 @@ class TrackingMonitor:
         self.tracking_data = _load_tracking()
         self._lock = asyncio.Lock()
         self._last_full_poll: float = 0  # timestamp of last full (all-packages) poll
+        self._last_low_poll: float = 0   # timestamp of last low-priority poll
+        self._last_error_dm: float = 0   # rate-limit DM spam prevention
         self._poll_loop.change_interval(minutes=BASE_POLL_MINUTES)
+
+    async def _dm_owner_error(self, title: str, detail: str):
+        """Send an error notification DM to the bot owner. Rate-limited to avoid spam."""
+        now = time.time()
+        # Don't DM more than once per 60 seconds for the same poll cycle
+        if now - self._last_error_dm < 10:
+            logger.debug("Suppressed error DM (rate-limited): %s", title)
+            return
+        try:
+            owner = await self.bot.fetch_user(OWNER_ID)
+            embed = discord.Embed(
+                title=f"\u26a0\ufe0f {title}",
+                description=detail[:4000],
+                color=0xED4245,
+                timestamp=datetime.now(timezone.utc),
+            )
+            embed.set_footer(text="ZR Bot Error Notification")
+            await owner.send(embed=embed)
+            self._last_error_dm = now
+        except Exception as exc:
+            logger.error("Failed to DM owner about error: %s", exc)
 
     def start(self):
         if not self._poll_loop.is_running():
@@ -508,6 +556,10 @@ class TrackingMonitor:
             return results[0] if results else None
         except Exception as exc:
             logger.warning("Failed to check %s: %s", tracking_number, exc)
+            await self._dm_owner_error(
+                "Single Tracking Lookup Failed",
+                f"Failed to fetch tracking for `{tracking_number}`:\n```{exc}```",
+            )
             return None
 
     # -- Background loop --
@@ -539,23 +591,33 @@ class TrackingMonitor:
         if not self.tracking_data:
             return
 
-        # Separate high-priority packages (near delivery) from normal ones
-        priority_numbers = []
-        normal_numbers = []
+        # Separate packages into priority tiers
+        priority_numbers = []   # Near delivery — poll every cycle
+        normal_numbers = []     # In transit — poll at normal cadence
+        low_priority_numbers = []  # Label created / pre-shipment — poll infrequently
         for tn, entry in self.tracking_data.items():
-            if entry.get("last_status_category") in HIGH_PRIORITY_CATEGORIES:
+            cat = entry.get("last_status_category")
+            if cat in HIGH_PRIORITY_CATEGORIES:
                 priority_numbers.append(tn)
+            elif cat in LOW_PRIORITY_CATEGORIES:
+                low_priority_numbers.append(tn)
             else:
                 normal_numbers.append(tn)
 
         # Always poll priority packages. Only poll normal packages when
         # enough time has elapsed since the last full poll cycle.
+        # Low-priority packages only get polled on an even longer cadence.
         now_ts = time.time()
         full_interval_secs = self._normal_poll_interval_minutes * 60
         due_for_full_poll = (now_ts - self._last_full_poll) >= full_interval_secs
+        low_interval_secs = LOW_PRIORITY_POLL_MINUTES * 60
+        due_for_low_poll = (now_ts - self._last_low_poll) >= low_interval_secs
 
         if due_for_full_poll:
             tracking_numbers = priority_numbers + normal_numbers
+            if due_for_low_poll:
+                tracking_numbers += low_priority_numbers
+                self._last_low_poll = now_ts
             self._last_full_poll = now_ts
         else:
             tracking_numbers = priority_numbers
@@ -565,11 +627,14 @@ class TrackingMonitor:
 
         if priority_numbers and not due_for_full_poll:
             logger.info(
-                "Priority poll: %d high-priority packages (skipping %d normal)",
-                len(priority_numbers), len(normal_numbers),
+                "Priority poll: %d high-priority packages (skipping %d normal, %d low-priority)",
+                len(priority_numbers), len(normal_numbers), len(low_priority_numbers),
             )
         else:
-            logger.info("Polling %d tracked packages...", len(tracking_numbers))
+            skipped_low = len(low_priority_numbers) if not due_for_low_poll else 0
+            logger.info("Polling %d tracked packages...%s",
+                        len(tracking_numbers),
+                        f" (skipping {skipped_low} low-priority)" if skipped_low else "")
 
         # Process in batches of 35
         for batch_start in range(0, len(tracking_numbers), BATCH_SIZE):
@@ -580,9 +645,18 @@ class TrackingMonitor:
                 )
             except RateLimitError as e:
                 logger.warning("Rate limited, skipping remaining batches. Retry in %ds", e.retry_after)
+                await self._dm_owner_error(
+                    "USPS Rate Limited",
+                    f"Rate limited by USPS API. Retry after **{e.retry_after}s**.\n"
+                    f"Skipped remaining batches ({len(tracking_numbers) - batch_start} packages unpolled).",
+                )
                 return
             except Exception as exc:
                 logger.error("Batch fetch error: %s", exc)
+                await self._dm_owner_error(
+                    "USPS API Error",
+                    f"Batch fetch failed for {len(batch)} packages:\n```{exc}```",
+                )
                 continue
 
             for result in results:
@@ -601,6 +675,7 @@ class TrackingMonitor:
                 # Update stored status
                 entry["last_status_category"] = new_category
                 entry["last_status"] = result.get("status", "")
+                entry["last_checked_at"] = datetime.now(timezone.utc).isoformat()
 
                 # -- In-channel mode: edit the embed message --
                 if entry.get("channel_id") and entry.get("message_id"):
@@ -622,6 +697,18 @@ class TrackingMonitor:
     @_poll_loop.before_loop
     async def _before_poll(self):
         await self.bot.wait_until_ready()
+
+    @_poll_loop.error
+    async def _poll_loop_error(self, error: Exception):
+        """Handle unhandled errors in the poll loop and DM the owner."""
+        import traceback
+        tb = traceback.format_exception(type(error), error, error.__traceback__)
+        tb_text = "".join(tb)
+        logger.error("Poll loop crashed:\n%s", tb_text)
+        await self._dm_owner_error(
+            "Tracking Poll Loop Crashed",
+            f"The background polling loop encountered an unhandled error:\n```{tb_text[:3800]}```",
+        )
 
     # -- Notification helpers --
 
@@ -653,6 +740,7 @@ class TrackingMonitor:
             logger.info("DM sent for %s → %s", tn, category)
         except Exception as exc:
             logger.error("Failed to DM owner for %s: %s", tn, exc)
+            # Note: can't DM about DM failure (would loop), just log it
             return  # Don't mark as notified if DM failed
 
         entry[flag] = True
@@ -682,15 +770,24 @@ class TrackingMonitor:
                 tn, result, entry.get("user_id"), show_history=True, logo_url=USPS_LOGO_URL,
             )
             await message.edit(embed=embed)
-        except (discord.NotFound, discord.Forbidden):
+        except (discord.NotFound, discord.Forbidden) as exc:
             # Channel or message was deleted/inaccessible — stop trying
             entry["channel_id"] = None
             entry["message_id"] = None
             logger.warning("Channel/message gone for %s, stopping embed updates", tn)
+            await self._dm_owner_error(
+                "Embed Update Failed",
+                f"Channel/message for `{tn}` is gone ({type(exc).__name__}). Stopped embed updates for this package.",
+            )
         except Exception as exc:
             logger.error("Failed to update channel embed for %s: %s", tn, exc)
+            await self._dm_owner_error(
+                "Embed Update Error",
+                f"Failed to update embed for `{tn}`:\n```{exc}```",
+            )
 
     async def force_poll(self):
         """Manually trigger a poll cycle (for the /trackrefresh command)."""
         self._last_full_poll = 0  # Force a full poll of all packages
+        self._last_low_poll = 0   # Include low-priority packages too
         await self._poll_loop.coro(self)
