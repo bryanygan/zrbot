@@ -298,15 +298,14 @@ async def on_ready():
         bot.tracking_monitor.start()
         logger.info("USPS tracking monitor started")
 
-    # Sync commands to the guild
+    # Sync commands to the guild and globally (global needed for DM support)
+    await bot.tree.sync()
+    logger.info("Commands synced globally")
     if GUILD_ID:
         guild = discord.Object(id=int(GUILD_ID))
         bot.tree.copy_global_to(guild=guild)
         await bot.tree.sync(guild=guild)
         logger.info("Commands synced to guild %s", GUILD_ID)
-    else:
-        await bot.tree.sync()
-        logger.info("Commands synced globally")
 
     # Log vouch stats
     all_vouches = vouches_db.get("vouches", {})
