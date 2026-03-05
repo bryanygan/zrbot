@@ -3,12 +3,10 @@
 import asyncio
 import json
 import logging
-import os
 import shutil
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
 import aiohttp
 import discord

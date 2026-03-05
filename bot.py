@@ -2,8 +2,6 @@
 
 import json
 import logging
-import signal
-import sys
 from pathlib import Path
 
 import discord
@@ -38,7 +36,9 @@ def _load_vouches() -> dict:
 
 def _save_vouches(data: dict) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    VOUCHES_FILE.write_text(json.dumps(data, indent=2))
+    tmp = VOUCHES_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.replace(VOUCHES_FILE)
 
 
 # Migrate old vouches.json from project root if data/ version doesn't exist
@@ -114,8 +114,7 @@ async def setvouches(interaction: discord.Interaction, user: discord.User, vouch
 async def checkvouches(interaction: discord.Interaction, user: discord.User = None):
     target = user or interaction.user
     if target.id != interaction.user.id:
-        perms = interaction.user.guild_permissions
-        if not perms.manage_guild:
+        if not interaction.guild or not interaction.user.guild_permissions.manage_guild:
             return await interaction.response.send_message(
                 "You do not have permission to check others' vouches.", ephemeral=True
             )
@@ -420,34 +419,17 @@ async def on_ready():
 
 
 # ---------------------------------------------------------------------------
-# Graceful shutdown
-# ---------------------------------------------------------------------------
-
-def _graceful_shutdown(signum, frame):
-    """Save state and shut down cleanly on SIGTERM/SIGINT."""
-    sig_name = signal.Signals(signum).name
-    logger.info("Received %s, shutting down gracefully...", sig_name)
-
-    if bot.tracking_monitor:
-        bot.tracking_monitor.save_state()
-        logger.info("Tracking state saved")
-
-    # Let the bot close cleanly
-    if bot.loop and bot.loop.is_running():
-        bot.loop.create_task(bot.close())
-    else:
-        sys.exit(0)
-
-
-signal.signal(signal.SIGTERM, _graceful_shutdown)
-signal.signal(signal.SIGINT, _graceful_shutdown)
-
-# ---------------------------------------------------------------------------
-# Run
+# Run (with graceful shutdown)
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
         print("Missing DISCORD_TOKEN in .env")
         exit(1)
-    bot.run(DISCORD_TOKEN)
+    try:
+        bot.run(DISCORD_TOKEN)
+    finally:
+        # Save tracking state on any shutdown (SIGINT, SIGTERM, crash)
+        if getattr(bot, "tracking_monitor", None):
+            bot.tracking_monitor.save_state()
+            logger.info("Tracking state saved on shutdown")

@@ -1,7 +1,7 @@
 """Context menu command for converting a message's address to shipping CSV."""
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 
 import discord
 from discord import app_commands
@@ -146,7 +146,7 @@ def setup(bot: commands.Bot):
         embed = discord.Embed(
             title="\U0001f4e6 Shipping CSV Generated",
             color=0x57F287,
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
         )
         embed.add_field(name="From", value="\n".join(from_lines), inline=True)
         embed.add_field(name="To", value="\n".join(to_lines), inline=True)

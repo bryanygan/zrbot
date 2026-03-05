@@ -174,9 +174,14 @@ def setup(bot: commands.Bot):
             name_part = f"**{pkg_label}** (`{tn}`)" if pkg_label else f"`{tn}`"
             lines.append(f"{emoji} {name_part} \u2014 {label} \u2014 {user_mention} ({mode}){checked_str}{tier}")
 
+        description = "\n".join(lines)
+        # Discord embed description limit is 4096 chars
+        if len(description) > 4096:
+            description = description[:4090] + "\n..."
+
         embed = discord.Embed(
             title=f"\U0001f4e6 Tracked Packages ({len(data)})",
-            description="\n".join(lines),
+            description=description,
             color=0x5865F2,
         )
         embed.set_footer(text=f"Polling every {monitor._poll_interval_minutes} min")
@@ -342,21 +347,18 @@ def setup(bot: commands.Bot):
                 "Tracking monitor is not configured.", ephemeral=True
             )
 
-        from utils.tracking_monitor import STATUS_CONFIG, DEFAULT_STATUS_CONFIG, TERMINAL_CATEGORIES, _load_tracking
+        from utils.tracking_monitor import STATUS_CONFIG, DEFAULT_STATUS_CONFIG
 
         data = monitor.tracking_data
         active = len(data)
 
         # Count by status category
         category_counts = {}
-        delivered_count = 0
-        transit_days = []
         for tn, entry in data.items():
             cat = entry.get("last_status_category") or "Unknown"
             category_counts[cat] = category_counts.get(cat, 0) + 1
 
         # Load stats file for historical data
-        stats_file = monitor.tracking_data  # current active
         from pathlib import Path
         stats_path = Path(__file__).resolve().parent.parent / "data" / "stats.json"
         historical = {}
