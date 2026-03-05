@@ -2,6 +2,8 @@
 
 import json
 import logging
+import signal
+import sys
 from pathlib import Path
 
 import discord
@@ -281,12 +283,29 @@ async def on_interaction(interaction: discord.Interaction):
         user_id = entry.get("user_id") if entry else None
 
         from utils.tracking_monitor import build_tracking_embed, USPS_LOGO_URL
-        embed = build_tracking_embed(tn, result, user_id, logo_url=USPS_LOGO_URL, max_events=50)
+        embed = build_tracking_embed(tn, result, user_id, logo_url=USPS_LOGO_URL, max_events=50, package_label=entry.get("label") if entry else None)
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     elif custom_id.startswith("tracking_copy_"):
         tn = custom_id.removeprefix("tracking_copy_")
         await interaction.response.send_message(tn)
+
+    elif custom_id.startswith("tracking_confirm_"):
+        tn = custom_id.removeprefix("tracking_confirm_")
+        embed = discord.Embed(
+            title="\u2705 Package Received!",
+            description=(
+                "Thank you for confirming! We're glad your package arrived safely.\n\n"
+                "If you're happy with your purchase, **please leave a vouch** "
+                "to help us build trust with future customers!\n\n"
+                "If you have any questions or concerns about the package, "
+                "please feel free to reach out!"
+            ),
+            color=0x57F287,
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        from utils.tracking_monitor import _log_to_channel
+        await _log_to_channel(bot, f"\u2705 **{interaction.user}** confirmed receipt of `{tn}`")
 
 
 # ---------------------------------------------------------------------------
@@ -376,8 +395,9 @@ async def on_ready():
         bot.tracking_monitor.start()
         logger.info("USPS tracking monitor started")
         from utils.tracking_monitor import build_tracking_view
-        for tn in bot.tracking_monitor.tracking_data:
-            bot.add_view(build_tracking_view(tn))
+        for tn, entry in bot.tracking_monitor.tracking_data.items():
+            is_delivered = entry.get("last_status_category") == "Delivered"
+            bot.add_view(build_tracking_view(tn, delivered=is_delivered))
 
     # Sync commands to the guild and globally (global needed for DM support)
     await bot.tree.sync()
@@ -393,6 +413,34 @@ async def on_ready():
     total = sum(all_vouches.values())
     logger.info("Vouches loaded: %d total across %d users", total, len(all_vouches))
 
+    # Log startup to activity channel
+    from utils.tracking_monitor import _log_to_channel
+    tracking_count = len(bot.tracking_monitor.tracking_data) if bot.tracking_monitor else 0
+    await _log_to_channel(bot, f"\U0001f7e2 **ZR Bot online** — tracking {tracking_count} package(s)")
+
+
+# ---------------------------------------------------------------------------
+# Graceful shutdown
+# ---------------------------------------------------------------------------
+
+def _graceful_shutdown(signum, frame):
+    """Save state and shut down cleanly on SIGTERM/SIGINT."""
+    sig_name = signal.Signals(signum).name
+    logger.info("Received %s, shutting down gracefully...", sig_name)
+
+    if bot.tracking_monitor:
+        bot.tracking_monitor.save_state()
+        logger.info("Tracking state saved")
+
+    # Let the bot close cleanly
+    if bot.loop and bot.loop.is_running():
+        bot.loop.create_task(bot.close())
+    else:
+        sys.exit(0)
+
+
+signal.signal(signal.SIGTERM, _graceful_shutdown)
+signal.signal(signal.SIGINT, _graceful_shutdown)
 
 # ---------------------------------------------------------------------------
 # Run

@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,6 +24,11 @@ OWNER_ID = 745694160002089130
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 TRACKING_FILE = DATA_DIR / "tracking.json"
+BACKUP_DIR = DATA_DIR / "backups"
+MAX_BACKUPS = 10  # Keep last N backups
+BACKUP_INTERVAL_HOURS = 6
+
+LOG_CHANNEL_ID = 1377459975089295392
 
 USPS_TOKEN_URL = "https://api.usps.com/oauth2/v3/token"
 USPS_TRACKING_URL = "https://apis.usps.com/tracking/v3r2/tracking"
@@ -121,6 +127,62 @@ def _save_tracking(data: dict) -> None:
     tmp = TRACKING_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, indent=2))
     tmp.replace(TRACKING_FILE)
+
+
+def _backup_tracking() -> Path | None:
+    """Create a timestamped backup of tracking.json. Returns backup path or None."""
+    if not TRACKING_FILE.exists():
+        return None
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dest = BACKUP_DIR / f"tracking_{stamp}.json"
+    shutil.copy2(TRACKING_FILE, dest)
+    # Prune old backups
+    backups = sorted(BACKUP_DIR.glob("tracking_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for old in backups[MAX_BACKUPS:]:
+        old.unlink(missing_ok=True)
+    return dest
+
+
+STATS_FILE = DATA_DIR / "stats.json"
+
+
+def _record_delivery_stat(entry: dict):
+    """Record a delivery in the persistent stats file."""
+    stats = {}
+    if STATS_FILE.exists():
+        try:
+            stats = json.loads(STATS_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    stats["total_delivered"] = stats.get("total_delivered", 0) + 1
+
+    # Calculate delivery time if we have added_at
+    added_at = entry.get("added_at")
+    if added_at:
+        try:
+            added_dt = datetime.fromisoformat(added_at)
+            days = (datetime.now(timezone.utc) - added_dt.astimezone(timezone.utc)).days
+            stats["total_delivery_days"] = stats.get("total_delivery_days", 0) + days
+            stats["total_with_delivery_time"] = stats.get("total_with_delivery_time", 0) + 1
+        except (ValueError, TypeError):
+            pass
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    STATS_FILE.write_text(json.dumps(stats, indent=2))
+
+
+async def _log_to_channel(bot: discord.Client, message: str, *, embed: discord.Embed = None):
+    """Send a log message to the activity logging channel."""
+    try:
+        channel = bot.get_channel(LOG_CHANNEL_ID)
+        if not channel:
+            channel = await bot.fetch_channel(LOG_CHANNEL_ID)
+        if channel:
+            await channel.send(content=message, embed=embed)
+    except Exception as exc:
+        logger.error("Failed to log to channel: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -294,7 +356,7 @@ def _build_eta_countdown(delivery_info: dict, category: str) -> str:
     return ""
 
 
-def build_tracking_view(tracking_number: str) -> discord.ui.View:
+def build_tracking_view(tracking_number: str, *, delivered: bool = False) -> discord.ui.View:
     """Build a persistent button row for a tracking embed."""
     view = discord.ui.View(timeout=None)
     view.add_item(discord.ui.Button(
@@ -315,6 +377,13 @@ def build_tracking_view(tracking_number: str) -> discord.ui.View:
         style=discord.ButtonStyle.secondary,
         emoji="\U0001f4ce",
     ))
+    if delivered:
+        view.add_item(discord.ui.Button(
+            custom_id=f"tracking_confirm_{tracking_number}",
+            label="Confirm Received",
+            style=discord.ButtonStyle.success,
+            emoji="\u2705",
+        ))
     return view
 
 
@@ -326,6 +395,7 @@ def build_tracking_embed(
     show_history: bool = True,
     max_events: int = 2,
     logo_url: str | None = None,
+    package_label: str | None = None,
 ) -> discord.Embed:
     """Build a rich embed for a tracking update."""
     category = data.get("statusCategory", "Unknown")
@@ -362,6 +432,8 @@ def build_tracking_embed(
         embed.add_field(name="Service", value=mail_class, inline=True)
     if user_id:
         embed.add_field(name="Recipient", value=f"<@{user_id}>", inline=True)
+    if package_label:
+        embed.add_field(name="Package", value=package_label, inline=True)
 
     # Origin & Destination (city, state only for privacy)
     origin_city = data.get("originCity", "")
@@ -482,6 +554,7 @@ class TrackingMonitor:
         self._last_full_poll: float = 0
         self._last_low_poll: float = 0
         self._last_error_dm: float = 0
+        self._last_backup: float = 0
         self._poll_loop.change_interval(minutes=BASE_POLL_MINUTES)
 
     async def _dm_owner_error(self, title: str, detail: str):
@@ -551,6 +624,7 @@ class TrackingMonitor:
         user_id: int,
         channel_id: int | None = None,
         message_id: int | None = None,
+        label: str | None = None,
     ) -> bool:
         """Add a tracking number. Returns False if already tracked."""
         tn = tracking_number.strip().upper()
@@ -562,6 +636,7 @@ class TrackingMonitor:
                 "user_id": user_id,
                 "channel_id": channel_id,
                 "message_id": message_id,
+                "label": label,
                 "added_at": datetime.now(timezone.utc).isoformat(),
                 "last_status_category": None,
                 "last_status": None,
@@ -717,6 +792,16 @@ class TrackingMonitor:
                 if new_category != old_category and new_category in DM_TRIGGER_CATEGORIES:
                     await self._send_dm_notification(tn, entry, result, new_category)
 
+                # -- Channel logging for status changes --
+                if new_category != old_category and old_category is not None:
+                    pkg_label = entry.get("label") or tn
+                    user_mention = f"<@{entry['user_id']}>" if entry.get("user_id") else "Unknown"
+                    _, log_emoji, log_label = STATUS_CONFIG.get(new_category, DEFAULT_STATUS_CONFIG)
+                    await _log_to_channel(
+                        self.bot,
+                        f"{log_emoji} **{pkg_label}** (`{tn}`) for {user_mention} — {log_label}",
+                    )
+
             _save_tracking(self.tracking_data)
 
             # Small delay between batches to be polite to the API
@@ -725,6 +810,14 @@ class TrackingMonitor:
 
         # Re-evaluate loop speed in case packages gained/lost priority
         self._update_interval()
+
+        # Periodic backup
+        now_ts = time.time()
+        if now_ts - self._last_backup >= BACKUP_INTERVAL_HOURS * 3600:
+            path = _backup_tracking()
+            if path:
+                logger.info("Backup created: %s", path.name)
+            self._last_backup = now_ts
 
     @_poll_loop.before_loop
     async def _before_poll(self):
@@ -766,8 +859,9 @@ class TrackingMonitor:
 
         try:
             owner = await self.bot.fetch_user(OWNER_ID)
-            embed = build_tracking_embed(tn, result, entry.get("user_id"), logo_url=USPS_LOGO_URL)
-            view = build_tracking_view(tn)
+            is_delivered = category == "Delivered"
+            embed = build_tracking_embed(tn, result, entry.get("user_id"), logo_url=USPS_LOGO_URL, package_label=entry.get("label"))
+            view = build_tracking_view(tn, delivered=is_delivered)
             await owner.send(embed=embed, view=view)
             logger.info("DM sent for %s → %s", tn, category)
         except Exception as exc:
@@ -780,6 +874,19 @@ class TrackingMonitor:
         if category in TERMINAL_CATEGORIES:
             if entry.get("channel_id") and entry.get("message_id"):
                 await self._update_channel_embed(tn, entry, result)
+
+            # Record delivery stats
+            if category == "Delivered":
+                _record_delivery_stat(entry)
+
+            # Log to activity channel
+            pkg_label_text = entry.get("label") or tn
+            user_mention = f"<@{entry['user_id']}>" if entry.get("user_id") else "Unknown"
+            if category == "Delivered":
+                await _log_to_channel(self.bot, f"\U0001f4ec **{pkg_label_text}** (`{tn}`) for {user_mention} has been **delivered**!")
+            else:
+                await _log_to_channel(self.bot, f"\u21a9\ufe0f **{pkg_label_text}** (`{tn}`) for {user_mention} — **Return to Sender**")
+
             del self.tracking_data[tn]
             logger.info("Auto-removed delivered package %s", tn)
 
@@ -792,6 +899,9 @@ class TrackingMonitor:
         if not channel_id or not message_id:
             return
 
+        category = result.get("statusCategory", "")
+        is_delivered = category == "Delivered"
+
         try:
             channel = self.bot.get_channel(channel_id)
             if not channel:
@@ -799,11 +909,11 @@ class TrackingMonitor:
             message = await channel.fetch_message(message_id)
             embed = build_tracking_embed(
                 tn, result, entry.get("user_id"), show_history=True, logo_url=USPS_LOGO_URL,
+                package_label=entry.get("label"),
             )
-            view = build_tracking_view(tn)
+            view = build_tracking_view(tn, delivered=is_delivered)
             await message.edit(embed=embed, view=view)
         except (discord.NotFound, discord.Forbidden):
-            # Channel or message was deleted/inaccessible — stop trying
             entry["channel_id"] = None
             entry["message_id"] = None
             logger.warning("Channel/message gone for %s, stopping embed updates", tn)
@@ -815,3 +925,9 @@ class TrackingMonitor:
         self._last_full_poll = 0
         self._last_low_poll = 0
         await self._poll_loop.coro(self)
+
+    def save_state(self):
+        """Save tracking data and create backup (for graceful shutdown)."""
+        _save_tracking(self.tracking_data)
+        _backup_tracking()
+        logger.info("Tracking state saved and backed up")

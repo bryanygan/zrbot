@@ -1,8 +1,11 @@
 """Slash commands for USPS package tracking."""
 
+import json
+
 import discord
 from discord import app_commands
 from discord.ext import commands
+from datetime import datetime, timezone
 
 from config import AUTHORIZED_IDS
 
@@ -18,11 +21,13 @@ def setup(bot: commands.Bot):
     @app_commands.describe(
         tracking_number="USPS tracking number",
         user="The Discord user this package is for (auto-detected in DMs)",
+        label="Optional nickname for this package (e.g., 'Jordan 4s for @user')",
     )
     async def track_command(
         interaction: discord.Interaction,
         tracking_number: str,
         user: discord.User = None,
+        label: str = None,
     ):
         if not _is_authorized(interaction):
             return await interaction.response.send_message(
@@ -56,12 +61,11 @@ def setup(bot: commands.Bot):
 
         result = await monitor.check_single(tn)
 
-        from utils.tracking_monitor import build_tracking_embed, build_tracking_view, _save_tracking, USPS_LOGO_URL
+        from utils.tracking_monitor import build_tracking_embed, build_tracking_view, _save_tracking, _log_to_channel, USPS_LOGO_URL
 
         usps_not_found = not result or "error" in result or result.get("statusCode") == "404"
 
         if usps_not_found:
-            # USPS doesn't know about this number yet — accept it with a pending status
             result = {
                 "statusCategory": "Waiting for USPS",
                 "status": "Waiting for USPS",
@@ -69,15 +73,20 @@ def setup(bot: commands.Bot):
                 "trackingEvents": [],
             }
 
-        embed = build_tracking_embed(tn, result, user_id, logo_url=USPS_LOGO_URL)
+        embed = build_tracking_embed(tn, result, user_id, logo_url=USPS_LOGO_URL, package_label=label)
         view = build_tracking_view(tn)
         msg = await interaction.followup.send(embed=embed, view=view, wait=True)
-        await monitor.add(tn, user_id, channel_id=msg.channel.id, message_id=msg.id)
+        await monitor.add(tn, user_id, channel_id=msg.channel.id, message_id=msg.id, label=label)
 
         entry = monitor.tracking_data[tn]
         entry["last_status_category"] = result.get("statusCategory")
         entry["last_status"] = result.get("status")
         _save_tracking(monitor.tracking_data)
+
+        # Log to activity channel
+        pkg_display = label or tn
+        user_mention = f"<@{user_id}>" if user_id else "Unknown"
+        await _log_to_channel(bot, f"\U0001f4e6 New package tracked: **{pkg_display}** (`{tn}`) for {user_mention}")
 
     @bot.tree.command(name="untrack", description="Stop tracking a USPS package")
     @app_commands.allowed_installs(guilds=True, users=True)
@@ -99,7 +108,12 @@ def setup(bot: commands.Bot):
             )
 
         tn = tracking_number.strip().upper()
+        entry = monitor.tracking_data.get(tn)
         if monitor.remove(tn):
+            from utils.tracking_monitor import _log_to_channel
+            pkg_label = entry.get("label") if entry else None
+            pkg_display = pkg_label or tn
+            await _log_to_channel(bot, f"\u274c Stopped tracking: **{pkg_display}** (`{tn}`)")
             await interaction.response.send_message(
                 f"Stopped tracking `{tn}`.", ephemeral=True
             )
@@ -156,7 +170,9 @@ def setup(bot: commands.Bot):
             elif cat in LOW_PRIORITY_CATEGORIES:
                 tier = " \U0001f535"  # blue circle = low priority
 
-            lines.append(f"{emoji} `{tn}` \u2014 {label} \u2014 {user_mention} ({mode}){checked_str}{tier}")
+            pkg_label = entry.get("label")
+            name_part = f"**{pkg_label}** (`{tn}`)" if pkg_label else f"`{tn}`"
+            lines.append(f"{emoji} {name_part} \u2014 {label} \u2014 {user_mention} ({mode}){checked_str}{tier}")
 
         embed = discord.Embed(
             title=f"\U0001f4e6 Tracked Packages ({len(data)})",
@@ -225,5 +241,161 @@ def setup(bot: commands.Bot):
         user_id = entry.get("user_id") if entry else None
 
         from utils.tracking_monitor import build_tracking_embed, USPS_LOGO_URL
-        embed = build_tracking_embed(tn, result, user_id, logo_url=USPS_LOGO_URL)
+        embed = build_tracking_embed(tn, result, user_id, logo_url=USPS_LOGO_URL, package_label=entry.get("label") if entry else None)
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @bot.tree.command(name="bulktrack", description="Track multiple USPS packages at once")
+    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    @app_commands.describe(
+        tracking_numbers="Comma-separated tracking numbers",
+        user="The Discord user these packages are for",
+    )
+    async def bulktrack_command(
+        interaction: discord.Interaction,
+        tracking_numbers: str,
+        user: discord.User = None,
+    ):
+        if not _is_authorized(interaction):
+            return await interaction.response.send_message(
+                "You are not authorized.", ephemeral=True
+            )
+
+        monitor = getattr(bot, "tracking_monitor", None)
+        if not monitor:
+            return await interaction.response.send_message(
+                "Tracking monitor is not configured.", ephemeral=True
+            )
+
+        if user is None and interaction.guild is None:
+            channel = interaction.channel
+            if hasattr(channel, "recipient") and channel.recipient:
+                user = channel.recipient
+
+        user_id = user.id if user else None
+
+        # Parse tracking numbers
+        numbers = [n.strip().upper() for n in tracking_numbers.split(",") if n.strip()]
+        if not numbers:
+            return await interaction.response.send_message(
+                "No valid tracking numbers provided.", ephemeral=True
+            )
+        if len(numbers) > 10:
+            return await interaction.response.send_message(
+                "Maximum 10 tracking numbers at once.", ephemeral=True
+            )
+
+        await interaction.response.defer(ephemeral=False)
+
+        from utils.tracking_monitor import build_tracking_embed, build_tracking_view, _save_tracking, _log_to_channel, USPS_LOGO_URL
+
+        added = []
+        skipped = []
+        for tn in numbers:
+            if tn in monitor.tracking_data:
+                skipped.append(tn)
+                continue
+
+            result = await monitor.check_single(tn)
+            usps_not_found = not result or "error" in result or result.get("statusCode") == "404"
+            if usps_not_found:
+                result = {
+                    "statusCategory": "Waiting for USPS",
+                    "status": "Waiting for USPS",
+                    "statusSummary": "Label created but USPS hasn't registered this package yet.",
+                    "trackingEvents": [],
+                }
+
+            embed = build_tracking_embed(tn, result, user_id, logo_url=USPS_LOGO_URL)
+            view = build_tracking_view(tn)
+            msg = await interaction.followup.send(embed=embed, view=view, wait=True)
+            await monitor.add(tn, user_id, channel_id=msg.channel.id, message_id=msg.id)
+
+            entry = monitor.tracking_data[tn]
+            entry["last_status_category"] = result.get("statusCategory")
+            entry["last_status"] = result.get("status")
+            added.append(tn)
+
+        _save_tracking(monitor.tracking_data)
+
+        summary = f"Tracked **{len(added)}** package(s)."
+        if skipped:
+            summary += f" Skipped **{len(skipped)}** (already tracked)."
+        await interaction.followup.send(summary, ephemeral=True)
+
+        if added:
+            user_mention = f"<@{user_id}>" if user_id else "Unknown"
+            await _log_to_channel(bot, f"\U0001f4e6 Bulk tracked **{len(added)}** package(s) for {user_mention}")
+
+    @bot.tree.command(name="stats", description="Show shipping statistics")
+    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    async def stats_command(interaction: discord.Interaction):
+        if not _is_authorized(interaction):
+            return await interaction.response.send_message(
+                "You are not authorized.", ephemeral=True
+            )
+
+        monitor = getattr(bot, "tracking_monitor", None)
+        if not monitor:
+            return await interaction.response.send_message(
+                "Tracking monitor is not configured.", ephemeral=True
+            )
+
+        from utils.tracking_monitor import STATUS_CONFIG, DEFAULT_STATUS_CONFIG, TERMINAL_CATEGORIES, _load_tracking
+
+        data = monitor.tracking_data
+        active = len(data)
+
+        # Count by status category
+        category_counts = {}
+        delivered_count = 0
+        transit_days = []
+        for tn, entry in data.items():
+            cat = entry.get("last_status_category") or "Unknown"
+            category_counts[cat] = category_counts.get(cat, 0) + 1
+
+        # Load stats file for historical data
+        stats_file = monitor.tracking_data  # current active
+        from pathlib import Path
+        stats_path = Path(__file__).resolve().parent.parent / "data" / "stats.json"
+        historical = {}
+        if stats_path.exists():
+            try:
+                historical = json.loads(stats_path.read_text())
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        total_shipped = historical.get("total_delivered", 0)
+        total_delivery_days = historical.get("total_delivery_days", 0)
+        total_with_delivery_time = historical.get("total_with_delivery_time", 0)
+
+        avg_delivery = ""
+        if total_with_delivery_time > 0:
+            avg = total_delivery_days / total_with_delivery_time
+            avg_delivery = f"{avg:.1f} days"
+
+        embed = discord.Embed(
+            title="\U0001f4ca Shipping Statistics",
+            color=0x5865F2,
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.add_field(name="Active Packages", value=str(active), inline=True)
+        embed.add_field(name="Total Delivered", value=str(total_shipped), inline=True)
+        if avg_delivery:
+            embed.add_field(name="Avg Delivery Time", value=avg_delivery, inline=True)
+
+        # Status breakdown
+        if category_counts:
+            breakdown_lines = []
+            for cat, count in sorted(category_counts.items(), key=lambda x: x[1], reverse=True):
+                _, emoji, lbl = STATUS_CONFIG.get(cat, DEFAULT_STATUS_CONFIG)
+                breakdown_lines.append(f"{emoji} {lbl}: **{count}**")
+            embed.add_field(
+                name="Active Breakdown",
+                value="\n".join(breakdown_lines),
+                inline=False,
+            )
+
+        embed.set_footer(text=f"Polling every {monitor._poll_interval_minutes} min")
+        await interaction.response.send_message(embed=embed, ephemeral=True)

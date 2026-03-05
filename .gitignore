@@ -27,6 +27,7 @@ desktop.ini
 .vscode/
 .idea/
 *.swp
+.claude/
 
 # pytest
 .pytest_cache/
