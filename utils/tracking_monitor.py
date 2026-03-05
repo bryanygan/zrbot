@@ -31,7 +31,11 @@ BATCH_SIZE = 35  # USPS max per request
 BASE_POLL_MINUTES = 30
 MIN_POLL_MINUTES = 15
 MAX_POLL_MINUTES = 60
+PRIORITY_POLL_MINUTES = 10  # Faster polling for high-priority packages
 MAX_TRACKING_DAYS = 60  # Auto-remove packages older than this
+
+# Statuses near final delivery — these packages get polled more frequently
+HIGH_PRIORITY_CATEGORIES = {"Out for Delivery", "Delivery Attempt", "Available for Pickup"}
 
 # USPS logo thumbnail — swap between the two logos here:
 # "USPS-Logo.png" (icon only) or "USPS_Logo_Text.webp" (icon + text)
@@ -403,6 +407,7 @@ class TrackingMonitor:
         self.consumer_secret = consumer_secret
         self.tracking_data = _load_tracking()
         self._lock = asyncio.Lock()
+        self._last_full_poll: float = 0  # timestamp of last full (all-packages) poll
         self._poll_loop.change_interval(minutes=BASE_POLL_MINUTES)
 
     def start(self):
@@ -415,7 +420,15 @@ class TrackingMonitor:
             self._poll_loop.cancel()
 
     @property
-    def _poll_interval_minutes(self) -> int:
+    def _has_priority_packages(self) -> bool:
+        return any(
+            entry.get("last_status_category") in HIGH_PRIORITY_CATEGORIES
+            for entry in self.tracking_data.values()
+        )
+
+    @property
+    def _normal_poll_interval_minutes(self) -> int:
+        """Interval for non-priority packages (the 'full poll' cadence)."""
         count = len(self.tracking_data)
         if count == 0:
             return MAX_POLL_MINUTES
@@ -424,6 +437,12 @@ class TrackingMonitor:
         if count <= 70:
             return 20
         return MIN_POLL_MINUTES
+
+    @property
+    def _poll_interval_minutes(self) -> int:
+        if self._has_priority_packages:
+            return PRIORITY_POLL_MINUTES
+        return self._normal_poll_interval_minutes
 
     def _update_interval(self):
         new_interval = self._poll_interval_minutes
@@ -520,8 +539,37 @@ class TrackingMonitor:
         if not self.tracking_data:
             return
 
-        tracking_numbers = list(self.tracking_data.keys())
-        logger.info("Polling %d tracked packages...", len(tracking_numbers))
+        # Separate high-priority packages (near delivery) from normal ones
+        priority_numbers = []
+        normal_numbers = []
+        for tn, entry in self.tracking_data.items():
+            if entry.get("last_status_category") in HIGH_PRIORITY_CATEGORIES:
+                priority_numbers.append(tn)
+            else:
+                normal_numbers.append(tn)
+
+        # Always poll priority packages. Only poll normal packages when
+        # enough time has elapsed since the last full poll cycle.
+        now_ts = time.time()
+        full_interval_secs = self._normal_poll_interval_minutes * 60
+        due_for_full_poll = (now_ts - self._last_full_poll) >= full_interval_secs
+
+        if due_for_full_poll:
+            tracking_numbers = priority_numbers + normal_numbers
+            self._last_full_poll = now_ts
+        else:
+            tracking_numbers = priority_numbers
+
+        if not tracking_numbers:
+            return
+
+        if priority_numbers and not due_for_full_poll:
+            logger.info(
+                "Priority poll: %d high-priority packages (skipping %d normal)",
+                len(priority_numbers), len(normal_numbers),
+            )
+        else:
+            logger.info("Polling %d tracked packages...", len(tracking_numbers))
 
         # Process in batches of 35
         for batch_start in range(0, len(tracking_numbers), BATCH_SIZE):
@@ -567,6 +615,9 @@ class TrackingMonitor:
             # Small delay between batches to be polite to the API
             if batch_start + BATCH_SIZE < len(tracking_numbers):
                 await asyncio.sleep(2)
+
+        # Re-evaluate loop speed in case packages gained/lost priority status
+        self._update_interval()
 
     @_poll_loop.before_loop
     async def _before_poll(self):
@@ -641,4 +692,5 @@ class TrackingMonitor:
 
     async def force_poll(self):
         """Manually trigger a poll cycle (for the /trackrefresh command)."""
+        self._last_full_poll = 0  # Force a full poll of all packages
         await self._poll_loop.coro(self)
