@@ -787,9 +787,6 @@ class TrackingMonitor:
                 # -- In-channel mode: edit the embed message --
                 if entry.get("channel_id") and entry.get("message_id"):
                     await self._update_channel_embed(tn, entry, result)
-                elif not entry.get("channel_id") and entry.get("user_id") and new_category != old_category:
-                    # No channel access (e.g. user-to-user DM) — establish a bot DM
-                    await self._establish_bot_dm(tn, entry, result)
 
                 # -- DM notifications for trigger categories --
                 if new_category != old_category and new_category in DM_TRIGGER_CATEGORIES:
@@ -918,48 +915,11 @@ class TrackingMonitor:
             message = await channel.fetch_message(message_id)
             await message.edit(embed=embed, view=view)
         except (discord.NotFound, discord.Forbidden):
-            # Can't access the channel (likely a user-to-user DM where bot isn't a member).
-            # Fall back: send a new embed in a direct bot→customer DM so we can edit it going forward.
-            user_id = entry.get("user_id")
-            if user_id:
-                try:
-                    user = await self.bot.fetch_user(user_id)
-                    msg = await user.send(embed=embed, view=view)
-                    # Migrate tracking to this new bot DM channel
-                    entry["channel_id"] = msg.channel.id
-                    entry["message_id"] = msg.id
-                    logger.info("Migrated %s to bot DM with user %s", tn, user_id)
-                    return
-                except Exception as dm_exc:
-                    logger.error("DM fallback failed for %s: %s", tn, dm_exc)
             entry["channel_id"] = None
             entry["message_id"] = None
-            logger.warning("Channel/message gone for %s, no fallback available", tn)
+            logger.warning("Channel/message gone for %s, stopping embed updates", tn)
         except Exception as exc:
             logger.error("Failed to update channel embed for %s: %s", tn, exc)
-
-    async def _establish_bot_dm(
-        self, tn: str, entry: dict, result: dict,
-    ):
-        """Send a tracking embed via bot DM when the original channel is inaccessible."""
-        user_id = entry.get("user_id")
-        if not user_id:
-            return
-        category = result.get("statusCategory", "")
-        is_delivered = category == "Delivered"
-        try:
-            user = await self.bot.fetch_user(user_id)
-            embed = build_tracking_embed(
-                tn, result, user_id, show_history=True, logo_url=USPS_LOGO_URL,
-                package_label=entry.get("label"),
-            )
-            view = build_tracking_view(tn, delivered=is_delivered)
-            msg = await user.send(embed=embed, view=view)
-            entry["channel_id"] = msg.channel.id
-            entry["message_id"] = msg.id
-            logger.info("Established bot DM for %s with user %s", tn, user_id)
-        except Exception as exc:
-            logger.error("Failed to establish bot DM for %s: %s", tn, exc)
 
     async def force_poll(self):
         """Manually trigger a poll cycle (for the /trackrefresh command)."""
