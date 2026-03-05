@@ -56,9 +56,9 @@ def setup(bot: commands.Bot):
                 ephemeral=True,
             )
 
-        from utils.tracking_monitor import build_tracking_embed, _save_tracking
+        from utils.tracking_monitor import build_tracking_embed, _save_tracking, USPS_LOGO_URL
 
-        embed = build_tracking_embed(tn, result, user.id)
+        embed = build_tracking_embed(tn, result, user.id, logo_url=USPS_LOGO_URL)
         msg = await interaction.followup.send(embed=embed, wait=True)
         monitor.add(tn, user.id, channel_id=msg.channel.id, message_id=msg.id)
 
@@ -185,6 +185,6 @@ def setup(bot: commands.Bot):
         entry = monitor.tracking_data.get(tn)
         user_id = entry.get("user_id") if entry else None
 
-        from utils.tracking_monitor import build_tracking_embed
-        embed = build_tracking_embed(tn, result, user_id)
+        from utils.tracking_monitor import build_tracking_embed, USPS_LOGO_URL
+        embed = build_tracking_embed(tn, result, user_id, logo_url=USPS_LOGO_URL)
         await interaction.followup.send(embed=embed, ephemeral=True)

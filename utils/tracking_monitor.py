@@ -31,6 +31,10 @@ BASE_POLL_MINUTES = 30
 MIN_POLL_MINUTES = 15
 MAX_POLL_MINUTES = 60
 
+# USPS logo thumbnail — swap between the two logos here:
+# "USPS-Logo.png" (icon only) or "USPS_Logo_Text.webp" (icon + text)
+USPS_LOGO_URL = "https://raw.githubusercontent.com/bryanygan/zrbot/main/assets/USPS_Logo_Text.webp"
+
 # Status category → (color, emoji, short label)
 STATUS_CONFIG = {
     "Delivered":           (0x57F287, "\U0001f4ec", "Delivered"),           # green, 📬
@@ -196,6 +200,62 @@ def _format_event_time(event: dict) -> str:
         return ts
 
 
+USPS_TRACKING_PAGE = "https://tools.usps.com/go/TrackConfirmAction?tLabels="
+
+# Progress bar steps
+_PROGRESS_STEPS = ["Label Created", "In Transit", "Out for Delivery", "Delivered"]
+_PROGRESS_CATEGORY_MAP = {
+    "Pre-Shipment": 0,
+    "Shipping Label Created": 0,
+    "USPS Awaiting Item": 0,
+    "On the Way": 1,
+    "In Transit": 1,
+    "International Transit": 1,
+    "Out for Delivery": 2,
+    "Delivery Attempt": 2,
+    "Available for Pickup": 2,
+    "Delivered": 3,
+}
+
+
+def _build_progress_bar(category: str) -> str:
+    """Build a visual progress indicator for the package journey."""
+    step = _PROGRESS_CATEGORY_MAP.get(category)
+    if step is None:
+        return ""
+    parts = []
+    for i, label in enumerate(_PROGRESS_STEPS):
+        if i < step:
+            parts.append(f"\u2705 ~~{label}~~")
+        elif i == step:
+            parts.append(f"\u25b6\ufe0f **{label}**")
+        else:
+            parts.append(f"\u2b1c {label}")
+    return " \u2192 ".join(parts)
+
+
+def _calculate_days_in_transit(events: list[dict]) -> int | None:
+    """Calculate days since the first tracking event."""
+    if not events:
+        return None
+    # Find the earliest event
+    earliest_ts = None
+    for ev in events:
+        ts = ev.get("eventTimestamp", "")
+        if not ts:
+            continue
+        try:
+            dt = datetime.fromisoformat(ts)
+            if earliest_ts is None or dt < earliest_ts:
+                earliest_ts = dt
+        except (ValueError, TypeError):
+            continue
+    if earliest_ts is None:
+        return None
+    delta = datetime.now(timezone.utc) - earliest_ts.astimezone(timezone.utc)
+    return max(0, delta.days)
+
+
 def build_tracking_embed(
     tracking_number: str,
     data: dict,
@@ -203,41 +263,68 @@ def build_tracking_embed(
     *,
     show_history: bool = True,
     max_events: int = 6,
+    logo_url: str | None = None,
 ) -> discord.Embed:
     """Build a rich embed for a tracking update."""
     category = data.get("statusCategory", "Unknown")
     color, emoji, label = STATUS_CONFIG.get(category, DEFAULT_STATUS_CONFIG)
 
-    status_text = data.get("status", category)
     summary = data.get("statusSummary", "")
     mail_class = _clean_mail_class(data.get("mailClass", ""))
     events = data.get("trackingEvents", [])
     delivery_info = data.get("deliveryDateExpectation", {})
 
+    # Build description with progress bar
+    desc_parts = []
+    if summary:
+        desc_parts.append(summary)
+    progress = _build_progress_bar(category)
+    if progress:
+        desc_parts.append(f"\n{progress}")
+
     embed = discord.Embed(
         title=f"{emoji}  {label}",
-        description=summary if summary else None,
+        description="\n".join(desc_parts) if desc_parts else None,
         color=color,
+        url=f"{USPS_TRACKING_PAGE}{tracking_number}",
         timestamp=datetime.now(timezone.utc),
     )
 
+    # USPS logo thumbnail
+    if logo_url:
+        embed.set_thumbnail(url=logo_url)
+
     # Header fields
-    embed.add_field(name="Tracking #", value=f"`{tracking_number}`", inline=True)
+    embed.add_field(name="Tracking #", value=f"[`{tracking_number}`]({USPS_TRACKING_PAGE}{tracking_number})", inline=True)
     if mail_class:
         embed.add_field(name="Service", value=mail_class, inline=True)
     if user_id:
         embed.add_field(name="Recipient", value=f"<@{user_id}>", inline=True)
 
-    # Expected delivery date
+    # Origin & Destination (city, state only for privacy)
+    origin_city = data.get("originCity", "")
+    origin_state = data.get("originState", "")
+    dest_city = data.get("destinationCity", "")
+    dest_state = data.get("destinationState", "")
+
+    origin = f"{origin_city.title()}, {origin_state}" if origin_city and origin_state else ""
+    dest = f"{dest_city.title()}, {dest_state}" if dest_city and dest_state else ""
+
+    if origin or dest:
+        route = f"{origin or 'Unknown'} \u2192 {dest or 'Unknown'}"
+        embed.add_field(name="Route", value=route, inline=True)
+
+    # Expected delivery date + window
     exp_date = delivery_info.get("expectedDeliveryDate") or delivery_info.get("predictedDeliveryDate")
     if exp_date and category not in TERMINAL_CATEGORIES:
         try:
             dt = datetime.strptime(exp_date, "%Y-%m-%d")
-            embed.add_field(
-                name="Expected Delivery",
-                value=f"<t:{int(dt.timestamp())}:D>",
-                inline=True,
-            )
+            delivery_text = f"<t:{int(dt.timestamp())}:D>"
+            # Check for delivery time window
+            delivery_time = delivery_info.get("expectedDeliveryTime") or delivery_info.get("predictedDeliveryEndTime") or ""
+            if delivery_time:
+                delivery_text += f"\nby {delivery_time}"
+            embed.add_field(name="Expected Delivery", value=delivery_text, inline=True)
         except ValueError:
             embed.add_field(name="Expected Delivery", value=exp_date, inline=True)
 
@@ -246,6 +333,12 @@ def build_tracking_embed(
         latest = events[0]
         loc = _format_location(latest)
         embed.add_field(name="Current Location", value=loc, inline=True)
+
+    # Days in transit
+    days = _calculate_days_in_transit(events)
+    if days is not None and category not in TERMINAL_CATEGORIES:
+        day_word = "day" if days == 1 else "days"
+        embed.add_field(name="In Transit", value=f"{days} {day_word}", inline=True)
 
     # Tracking history
     if show_history and events:
@@ -289,7 +382,7 @@ def build_tracking_embed(
             inline=False,
         )
 
-    embed.set_footer(text="USPS Tracking • Last checked")
+    embed.set_footer(text="USPS Tracking \u2022 Last checked")
     return embed
 
 
@@ -477,7 +570,7 @@ class TrackingMonitor:
 
         try:
             owner = await self.bot.fetch_user(OWNER_ID)
-            embed = build_tracking_embed(tn, result, entry.get("user_id"))
+            embed = build_tracking_embed(tn, result, entry.get("user_id"), logo_url=USPS_LOGO_URL)
             await owner.send(embed=embed)
             logger.info("DM sent for %s → %s", tn, category)
         except Exception as exc:
@@ -503,7 +596,7 @@ class TrackingMonitor:
                 channel = await self.bot.fetch_channel(channel_id)
             message = await channel.fetch_message(message_id)
             embed = build_tracking_embed(
-                tn, result, entry.get("user_id"), show_history=True,
+                tn, result, entry.get("user_id"), show_history=True, logo_url=USPS_LOGO_URL,
             )
             await message.edit(embed=embed)
         except discord.NotFound:
