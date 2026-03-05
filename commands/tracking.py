@@ -1,6 +1,7 @@
 """Slash commands for USPS package tracking."""
 
 import json
+import re
 
 import discord
 from discord import app_commands
@@ -14,12 +15,59 @@ def _is_authorized(interaction: discord.Interaction) -> bool:
     return interaction.user.id in AUTHORIZED_IDS
 
 
+def _parse_tracking_input(raw: str) -> tuple[str, str | None]:
+    """Parse 'Name : TrackingNumber' or plain tracking number.
+    Returns (tracking_number, label)."""
+    raw = raw.strip()
+    if ":" in raw:
+        parts = raw.split(":", 1)
+        name = parts[0].strip()
+        tn = parts[1].strip().upper()
+        if tn and re.match(r"^[A-Z0-9]+$", tn):
+            return tn, name or None
+    return raw.upper(), None
+
+
+def _parse_bulk_input(raw: str) -> list[tuple[str, str | None]]:
+    """Parse bulk tracking input. Supports:
+    - Comma-separated: 'TN1, TN2, TN3'
+    - Name:TN pairs (space or newline separated): 'Name1 : TN1 Name2 : TN2'
+    - Mixed formats
+    Returns list of (tracking_number, label)."""
+    results = []
+
+    # If input contains ":" it's likely Name:TN format
+    if ":" in raw:
+        # Split on patterns where a name starts after a tracking number
+        # Match: "Name : TrackingNumber" pairs
+        pairs = re.findall(r'([^:,\n]+?)\s*:\s*([A-Za-z0-9]+)', raw)
+        for name, tn in pairs:
+            name = name.strip()
+            tn = tn.strip().upper()
+            if tn:
+                results.append((tn, name or None))
+        if results:
+            return results
+
+    # Fall back to comma/space separated plain tracking numbers
+    # Split by comma, newline, or whitespace
+    parts = re.split(r'[,\n]+', raw)
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        tn, label = _parse_tracking_input(part)
+        if tn:
+            results.append((tn, label))
+    return results
+
+
 def setup(bot: commands.Bot):
     @bot.tree.command(name="track", description="Start tracking a USPS package")
     @app_commands.allowed_installs(guilds=True, users=True)
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
     @app_commands.describe(
-        tracking_number="USPS tracking number",
+        tracking_number="USPS tracking number (or 'Name : TrackingNumber')",
         user="The Discord user this package is for (auto-detected in DMs)",
         label="Optional nickname for this package (e.g., 'Jordan 4s for @user')",
     )
@@ -43,14 +91,16 @@ def setup(bot: commands.Bot):
 
         # Resolve recipient: explicit user > DM recipient > None
         if user is None and interaction.guild is None:
-            # In a DM — the other participant is the recipient
             channel = interaction.channel
             if hasattr(channel, "recipient") and channel.recipient:
                 user = channel.recipient
 
         user_id = user.id if user else None
 
-        tn = tracking_number.strip().upper()
+        # Parse "Name : TrackingNumber" format
+        tn, parsed_label = _parse_tracking_input(tracking_number)
+        if not label and parsed_label:
+            label = parsed_label
 
         if tn in monitor.tracking_data:
             return await interaction.response.send_message(
@@ -360,7 +410,7 @@ def setup(bot: commands.Bot):
     @app_commands.allowed_installs(guilds=True, users=True)
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
     @app_commands.describe(
-        tracking_numbers="Comma-separated tracking numbers",
+        tracking_numbers="Tracking numbers: comma-separated, or 'Name : TN' pairs separated by spaces",
         user="The Discord user these packages are for",
     )
     async def bulktrack_command(
@@ -386,15 +436,15 @@ def setup(bot: commands.Bot):
 
         user_id = user.id if user else None
 
-        # Parse tracking numbers
-        numbers = [n.strip().upper() for n in tracking_numbers.split(",") if n.strip()]
-        if not numbers:
+        # Parse tracking numbers (supports "Name : TN" pairs and plain numbers)
+        parsed = _parse_bulk_input(tracking_numbers)
+        if not parsed:
             return await interaction.response.send_message(
                 "No valid tracking numbers provided.", ephemeral=True
             )
-        if len(numbers) > 10:
+        if len(parsed) > 20:
             return await interaction.response.send_message(
-                "Maximum 10 tracking numbers at once.", ephemeral=True
+                "Maximum 20 tracking numbers at once.", ephemeral=True
             )
 
         await interaction.response.defer(ephemeral=False)
@@ -404,7 +454,7 @@ def setup(bot: commands.Bot):
         is_dm = interaction.guild is None
         added = []
         skipped = []
-        for tn in numbers:
+        for tn, parsed_label in parsed:
             if tn in monitor.tracking_data:
                 skipped.append(tn)
                 continue
@@ -419,17 +469,17 @@ def setup(bot: commands.Bot):
                     "trackingEvents": [],
                 }
 
-            embed = build_tracking_embed(tn, result, user_id, logo_url=USPS_LOGO_URL)
+            embed = build_tracking_embed(tn, result, user_id, logo_url=USPS_LOGO_URL, package_label=parsed_label)
 
             if is_dm:
                 embed.set_footer(text="USPS Tracking \u2022 Use 'Get Live Updates' for automatic updates")
                 view = build_dm_tracking_view(tn)
                 msg = await interaction.followup.send(embed=embed, view=view, wait=True)
-                await monitor.add(tn, user_id, channel_id=None, message_id=None)
+                await monitor.add(tn, user_id, channel_id=None, message_id=None, label=parsed_label)
             else:
                 view = build_tracking_view(tn)
                 msg = await interaction.followup.send(embed=embed, view=view, wait=True)
-                await monitor.add(tn, user_id, channel_id=msg.channel.id, message_id=msg.id)
+                await monitor.add(tn, user_id, channel_id=msg.channel.id, message_id=msg.id, label=parsed_label)
 
             entry = monitor.tracking_data[tn]
             entry["last_status_category"] = result.get("statusCategory")

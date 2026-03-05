@@ -28,7 +28,7 @@ BACKUP_DIR = DATA_DIR / "backups"
 MAX_BACKUPS = 10  # Keep last N backups
 BACKUP_INTERVAL_HOURS = 6
 
-LOG_CHANNEL_ID = 1377459975089295392
+LOG_CHANNEL_ID = 1479208831153213561
 
 USPS_TOKEN_URL = "https://api.usps.com/oauth2/v3/token"
 USPS_TRACKING_URL = "https://apis.usps.com/tracking/v3r2/tracking"
