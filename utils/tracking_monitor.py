@@ -268,16 +268,141 @@ def _calculate_days_in_transit(events: list[dict]) -> int | None:
     return max(0, delta.days)
 
 
-def build_tracking_embed(
+def _format_event_time_relative(event: dict) -> str:
+    """Return a Discord relative timestamp (<t:...:R>) for an event."""
+    ts = event.get("eventTimestamp", "")
+    if not ts:
+        return ""
+    try:
+        dt = datetime.fromisoformat(ts)
+        return f"<t:{int(dt.timestamp())}:R>"
+    except (ValueError, TypeError):
+        return ts
+
+
+def _build_eta_line(delivery_info: dict, category: str) -> str:
+    """Build a concise ETA line for the summary embed description."""
+    if category in TERMINAL_CATEGORIES:
+        return ""
+    exp_date = delivery_info.get("expectedDeliveryDate") or delivery_info.get("predictedDeliveryDate")
+    if not exp_date:
+        return ""
+    try:
+        dt = datetime.strptime(exp_date, "%Y-%m-%d")
+        today = datetime.now().date()
+        days_until = (dt.date() - today).days
+
+        # Format date as "Thu, Mar 6"
+        date_str = dt.strftime("%a, %b %-d")
+
+        # Delivery time window
+        delivery_time = delivery_info.get("expectedDeliveryTime") or delivery_info.get("predictedDeliveryEndTime") or ""
+        time_part = f" \u2022 by {delivery_time}" if delivery_time else ""
+
+        # Countdown prefix
+        if days_until < 0:
+            return f"\u26a0\ufe0f **Past expected delivery** ({date_str})"
+        elif days_until == 0:
+            return f"\U0001f389 **Arriving today!**{time_part}"
+        elif days_until == 1:
+            return f"\U0001f4e8 **Arriving tomorrow!**{time_part}"
+        elif days_until <= 3:
+            return f"ETA: **{date_str}** ({days_until} days){time_part}"
+        else:
+            return f"ETA: {date_str}{time_part}"
+    except ValueError:
+        return f"ETA: {exp_date}"
+
+
+def build_summary_embed(
     tracking_number: str,
     data: dict,
     user_id: int | None = None,
     *,
-    show_history: bool = True,
-    max_events: int = 6,
     logo_url: str | None = None,
 ) -> discord.Embed:
-    """Build a rich embed for a tracking update."""
+    """Build a compact, mobile-friendly summary embed.
+
+    Shows status, ETA, and last 1-2 scans. Designed to be paired with
+    buttons for full details, USPS link, and copying the tracking number.
+    """
+    category = data.get("statusCategory", "Unknown")
+    color, emoji, label = STATUS_CONFIG.get(category, DEFAULT_STATUS_CONFIG)
+    mail_class = _clean_mail_class(data.get("mailClass", ""))
+    events = data.get("trackingEvents", [])
+    delivery_info = data.get("deliveryDateExpectation", {})
+
+    # --- Title: emoji + status + service ---
+    title = f"{emoji}  {label}"
+    if mail_class:
+        title += f" \u2014 {mail_class}"
+
+    # --- Description: ETA line + last scan ---
+    desc_lines = []
+
+    eta_line = _build_eta_line(delivery_info, category)
+    if eta_line:
+        desc_lines.append(eta_line)
+
+    # Last 1-2 scans (compact: "Event — Location • 2h ago")
+    for ev in events[:2]:
+        ev_type = ev.get("eventType", "Unknown")
+        ev_loc = _format_location(ev)
+        ev_rel = _format_event_time_relative(ev)
+        scan_line = f"{ev_type} \u2014 {ev_loc}"
+        if ev_rel:
+            scan_line += f" \u2022 {ev_rel}"
+        desc_lines.append(scan_line)
+
+    embed = discord.Embed(
+        title=title,
+        description="\n".join(desc_lines) if desc_lines else None,
+        color=color,
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    # USPS logo thumbnail
+    if logo_url:
+        embed.set_thumbnail(url=logo_url)
+
+    # Truncated tracking number
+    tn_short = f"\u2026{tracking_number[-5:]}" if len(tracking_number) > 5 else tracking_number
+    embed.add_field(name="Tracking #", value=f"`{tn_short}`", inline=True)
+
+    # Recipient
+    if user_id:
+        embed.add_field(name="Recipient", value=f"<@{user_id}>", inline=True)
+
+    # Destination (just the destination, not full route)
+    dest_city = data.get("destinationCity", "")
+    dest_state = data.get("destinationState", "")
+    if dest_city and dest_state:
+        embed.add_field(name="To", value=f"{dest_city.title()}, {dest_state}", inline=True)
+
+    # "Thank You!" for delivered packages
+    if category == "Delivered":
+        embed.add_field(
+            name="Thank You!",
+            value="Please leave a vouch if your package arrived safe! If you have any questions/concerns about the package, please feel free to reach out!",
+            inline=False,
+        )
+
+    embed.set_footer(text="USPS Tracking \u2022 Updated")
+    return embed
+
+
+def build_detail_embed(
+    tracking_number: str,
+    data: dict,
+    user_id: int | None = None,
+    *,
+    max_events: int = 50,
+    logo_url: str | None = None,
+) -> discord.Embed:
+    """Build a full detail embed with complete tracking history.
+
+    Used for /trackinfo and the 'Show Details' button interaction.
+    """
     category = data.get("statusCategory", "Unknown")
     color, emoji, label = STATUS_CONFIG.get(category, DEFAULT_STATUS_CONFIG)
 
@@ -306,14 +431,14 @@ def build_tracking_embed(
     if logo_url:
         embed.set_thumbnail(url=logo_url)
 
-    # Header fields
+    # Header fields — full tracking number
     embed.add_field(name="Tracking #", value=f"[`{tracking_number}`]({USPS_TRACKING_PAGE}{tracking_number})", inline=True)
     if mail_class:
         embed.add_field(name="Service", value=mail_class, inline=True)
     if user_id:
         embed.add_field(name="Recipient", value=f"<@{user_id}>", inline=True)
 
-    # Origin & Destination (city, state only for privacy)
+    # Origin & Destination
     origin_city = data.get("originCity", "")
     origin_state = data.get("originState", "")
     dest_city = data.get("destinationCity", "")
@@ -334,7 +459,6 @@ def build_tracking_embed(
             today = datetime.now().date()
             days_until = (dt.date() - today).days
 
-            # Build prominent countdown label
             if days_until < 0:
                 countdown = "\u26a0\ufe0f **Past expected delivery**"
             elif days_until == 0:
@@ -347,7 +471,6 @@ def build_tracking_embed(
                 countdown = ""
 
             delivery_text = f"<t:{int(dt.timestamp())}:D>"
-            # Check for delivery time window
             delivery_time = delivery_info.get("expectedDeliveryTime") or delivery_info.get("predictedDeliveryEndTime") or ""
             if delivery_time:
                 delivery_text += f"\nby {delivery_time}"
@@ -357,7 +480,7 @@ def build_tracking_embed(
         except ValueError:
             embed.add_field(name="Expected Delivery", value=exp_date, inline=True)
 
-    # Latest location
+    # Current location
     if events:
         latest = events[0]
         loc = _format_location(latest)
@@ -369,8 +492,8 @@ def build_tracking_embed(
         day_word = "day" if days == 1 else "days"
         embed.add_field(name="In Transit", value=f"{days} {day_word}", inline=True)
 
-    # Tracking history
-    if show_history and events:
+    # Full tracking history
+    if events:
         history_lines = []
         for ev in events[:max_events]:
             ev_time = _format_event_time(ev)
@@ -386,7 +509,7 @@ def build_tracking_embed(
         current_chunk = []
         current_len = 0
         for line in history_lines:
-            line_len = len(line) + 2  # account for \n\n separator
+            line_len = len(line) + 2
             if current_len + line_len > 1000 and current_chunk:
                 chunks.append("\n\n".join(current_chunk))
                 current_chunk = []
@@ -397,14 +520,13 @@ def build_tracking_embed(
             chunks.append("\n\n".join(current_chunk))
 
         remaining = len(events) - len(history_lines)
-        # Discord embeds have a max of 25 fields; cap history to a few fields
         for i, chunk in enumerate(chunks[:4]):
             field_name = "Tracking History" if i == 0 else f"History (cont'd {i + 1})"
             embed.add_field(name=field_name, value=chunk, inline=False)
         if remaining > 0:
             embed.add_field(
                 name="",
-                value=f"*...and {remaining} more events — [view full history on USPS]({USPS_TRACKING_PAGE}{tracking_number})*",
+                value=f"*...and {remaining} more events \u2014 [view full history on USPS]({USPS_TRACKING_PAGE}{tracking_number})*",
                 inline=False,
             )
 
@@ -415,8 +537,43 @@ def build_tracking_embed(
             inline=False,
         )
 
-    embed.set_footer(text="USPS Tracking \u2022 Last checked")
+    embed.set_footer(text="USPS Tracking \u2022 Full Details")
     return embed
+
+
+def build_tracking_view(tracking_number: str) -> discord.ui.View:
+    """Build a persistent button row for a tracking embed.
+
+    Buttons: Track on USPS (link) | Show Details | Copy #
+    Custom IDs encode the tracking number so handlers can look it up.
+    """
+    view = discord.ui.View(timeout=None)  # persistent view — no timeout
+
+    # Link button: opens USPS tracking page (no custom_id needed)
+    view.add_item(discord.ui.Button(
+        label="Track on USPS",
+        style=discord.ButtonStyle.link,
+        url=f"{USPS_TRACKING_PAGE}{tracking_number}",
+        emoji="\U0001f517",
+    ))
+
+    # Show Details button
+    view.add_item(discord.ui.Button(
+        custom_id=f"tracking_details_{tracking_number}",
+        label="Show Details",
+        style=discord.ButtonStyle.secondary,
+        emoji="\U0001f4cb",
+    ))
+
+    # Copy tracking number button
+    view.add_item(discord.ui.Button(
+        custom_id=f"tracking_copy_{tracking_number}",
+        label="Copy #",
+        style=discord.ButtonStyle.secondary,
+        emoji="\U0001f4ce",
+    ))
+
+    return view
 
 
 # ---------------------------------------------------------------------------
@@ -735,8 +892,9 @@ class TrackingMonitor:
 
         try:
             owner = await self.bot.fetch_user(OWNER_ID)
-            embed = build_tracking_embed(tn, result, entry.get("user_id"), logo_url=USPS_LOGO_URL)
-            await owner.send(embed=embed)
+            embed = build_summary_embed(tn, result, entry.get("user_id"), logo_url=USPS_LOGO_URL)
+            view = build_tracking_view(tn)
+            await owner.send(embed=embed, view=view)
             logger.info("DM sent for %s → %s", tn, category)
         except Exception as exc:
             logger.error("Failed to DM owner for %s: %s", tn, exc)
@@ -766,10 +924,11 @@ class TrackingMonitor:
             if not channel:
                 channel = await self.bot.fetch_channel(channel_id)
             message = await channel.fetch_message(message_id)
-            embed = build_tracking_embed(
-                tn, result, entry.get("user_id"), show_history=True, logo_url=USPS_LOGO_URL,
+            embed = build_summary_embed(
+                tn, result, entry.get("user_id"), logo_url=USPS_LOGO_URL,
             )
-            await message.edit(embed=embed)
+            view = build_tracking_view(tn)
+            await message.edit(embed=embed, view=view)
         except (discord.NotFound, discord.Forbidden) as exc:
             # Channel or message was deleted/inaccessible — stop trying
             entry["channel_id"] = None

@@ -56,10 +56,11 @@ def setup(bot: commands.Bot):
                 ephemeral=True,
             )
 
-        from utils.tracking_monitor import build_tracking_embed, _save_tracking, USPS_LOGO_URL
+        from utils.tracking_monitor import build_summary_embed, build_tracking_view, _save_tracking, USPS_LOGO_URL
 
-        embed = build_tracking_embed(tn, result, user.id, logo_url=USPS_LOGO_URL)
-        msg = await interaction.followup.send(embed=embed, wait=True)
+        embed = build_summary_embed(tn, result, user.id, logo_url=USPS_LOGO_URL)
+        view = build_tracking_view(tn)
+        msg = await interaction.followup.send(embed=embed, view=view, wait=True)
         await monitor.add(tn, user.id, channel_id=msg.channel.id, message_id=msg.id)
 
         entry = monitor.tracking_data[tn]
@@ -198,7 +199,6 @@ def setup(bot: commands.Bot):
         entry = monitor.tracking_data.get(tn)
         user_id = entry.get("user_id") if entry else None
 
-        from utils.tracking_monitor import build_tracking_embed, USPS_LOGO_URL
-        # Show full history (up to 50 events) for trackinfo lookups
-        embed = build_tracking_embed(tn, result, user_id, logo_url=USPS_LOGO_URL, max_events=50)
+        from utils.tracking_monitor import build_detail_embed, USPS_LOGO_URL
+        embed = build_detail_embed(tn, result, user_id, logo_url=USPS_LOGO_URL)
         await interaction.followup.send(embed=embed, ephemeral=True)

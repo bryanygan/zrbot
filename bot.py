@@ -265,6 +265,29 @@ async def on_interaction(interaction: discord.Interaction):
         if info:
             await interaction.response.send_message(info["value"], ephemeral=True)
 
+    # -- Tracking embed buttons --
+    elif custom_id.startswith("tracking_details_"):
+        tn = custom_id.removeprefix("tracking_details_")
+        monitor = getattr(bot, "tracking_monitor", None)
+        if not monitor:
+            return await interaction.response.send_message("Tracking monitor is not configured.", ephemeral=True)
+
+        await interaction.response.defer(ephemeral=True)
+        result = await monitor.check_single(tn)
+        if not result or "error" in result:
+            return await interaction.followup.send(f"Could not fetch details for `{tn}`.", ephemeral=True)
+
+        entry = monitor.tracking_data.get(tn)
+        user_id = entry.get("user_id") if entry else None
+
+        from utils.tracking_monitor import build_detail_embed, USPS_LOGO_URL
+        embed = build_detail_embed(tn, result, user_id, logo_url=USPS_LOGO_URL)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    elif custom_id.startswith("tracking_copy_"):
+        tn = custom_id.removeprefix("tracking_copy_")
+        await interaction.response.send_message(f"`{tn}`", ephemeral=True)
+
 
 # ---------------------------------------------------------------------------
 # Register USPS command modules
