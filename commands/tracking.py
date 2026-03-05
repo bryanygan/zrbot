@@ -225,10 +225,18 @@ def setup(bot: commands.Bot):
             view = _build_trackinglist_view(0, total_pages)
             await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
-    @bot.tree.command(name="trackrefresh", description="Force refresh all tracked packages now")
+    @bot.tree.command(name="trackrefresh", description="Force refresh tracked packages")
     @app_commands.allowed_installs(guilds=True, users=True)
     @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-    async def trackrefresh_command(interaction: discord.Interaction):
+    @app_commands.describe(
+        tracking_number="Specific tracking number to refresh",
+        user="Refresh all packages for this user",
+    )
+    async def trackrefresh_command(
+        interaction: discord.Interaction,
+        tracking_number: str = None,
+        user: discord.User = None,
+    ):
         if not _is_authorized(interaction):
             return await interaction.response.send_message(
                 "You are not authorized.", ephemeral=True
@@ -246,10 +254,71 @@ def setup(bot: commands.Bot):
             )
 
         await interaction.response.defer(ephemeral=True)
-        await monitor.force_poll()
-        await interaction.followup.send(
-            f"Refreshed {len(monitor.tracking_data)} package(s).", ephemeral=True
-        )
+
+        from utils.tracking_monitor import build_tracking_embed, build_tracking_view, _save_tracking, USPS_LOGO_URL
+
+        if tracking_number:
+            # Refresh a single tracking number
+            tn = tracking_number.strip().upper()
+            entry = monitor.tracking_data.get(tn)
+            if not entry:
+                return await interaction.followup.send(f"`{tn}` is not being tracked.", ephemeral=True)
+
+            result = await monitor.check_single(tn)
+            if result and "error" not in result and result.get("statusCode") != "404":
+                entry["last_status_category"] = result.get("statusCategory", "")
+                entry["last_status"] = result.get("status", "")
+                entry["last_checked_at"] = datetime.now(timezone.utc).isoformat()
+                if entry.get("channel_id") and entry.get("message_id"):
+                    category = result.get("statusCategory", "")
+                    is_delivered = category == "Delivered"
+                    try:
+                        channel = bot.get_channel(entry["channel_id"]) or await bot.fetch_channel(entry["channel_id"])
+                        message = await channel.fetch_message(entry["message_id"])
+                        embed = build_tracking_embed(tn, result, entry.get("user_id"), logo_url=USPS_LOGO_URL, package_label=entry.get("label"))
+                        view = build_tracking_view(tn, delivered=is_delivered)
+                        await message.edit(embed=embed, view=view)
+                    except Exception:
+                        pass
+                _save_tracking(monitor.tracking_data)
+                await interaction.followup.send(f"Refreshed `{tn}`.", ephemeral=True)
+            else:
+                await interaction.followup.send(f"Could not fetch data for `{tn}`.", ephemeral=True)
+
+        elif user:
+            # Refresh all packages for a specific user
+            user_packages = {tn: e for tn, e in monitor.tracking_data.items() if e.get("user_id") == user.id}
+            if not user_packages:
+                return await interaction.followup.send(f"No packages tracked for {user.mention}.", ephemeral=True)
+
+            refreshed = 0
+            for tn, entry in user_packages.items():
+                result = await monitor.check_single(tn)
+                if result and "error" not in result and result.get("statusCode") != "404":
+                    entry["last_status_category"] = result.get("statusCategory", "")
+                    entry["last_status"] = result.get("status", "")
+                    entry["last_checked_at"] = datetime.now(timezone.utc).isoformat()
+                    if entry.get("channel_id") and entry.get("message_id"):
+                        category = result.get("statusCategory", "")
+                        is_delivered = category == "Delivered"
+                        try:
+                            channel = bot.get_channel(entry["channel_id"]) or await bot.fetch_channel(entry["channel_id"])
+                            message = await channel.fetch_message(entry["message_id"])
+                            embed = build_tracking_embed(tn, result, entry.get("user_id"), logo_url=USPS_LOGO_URL, package_label=entry.get("label"))
+                            view = build_tracking_view(tn, delivered=is_delivered)
+                            await message.edit(embed=embed, view=view)
+                        except Exception:
+                            pass
+                    refreshed += 1
+            _save_tracking(monitor.tracking_data)
+            await interaction.followup.send(f"Refreshed **{refreshed}** package(s) for {user.mention}.", ephemeral=True)
+
+        else:
+            # Refresh all
+            await monitor.force_poll()
+            await interaction.followup.send(
+                f"Refreshed {len(monitor.tracking_data)} package(s).", ephemeral=True
+            )
 
     @bot.tree.command(name="trackinfo", description="Get current tracking info for a package")
     @app_commands.allowed_installs(guilds=True, users=True)
