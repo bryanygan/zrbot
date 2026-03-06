@@ -24,22 +24,31 @@ A Discord bot created for ZRServer for vouch tracking, USPS package tracking, an
 
 - Real-time package tracking via the USPS API
 - Live-updating embeds that automatically edit with the latest status on each poll cycle
-- Rich embeds with tracking history, service type, current location, and expected delivery date
-- "Last checked" timestamp displayed in each user's local timezone
-- Automatic DM notifications when packages are out for delivery, delivered, or have issues
-- Delivered packages show a message prompting the recipient to leave a vouch
-- Adaptive polling intervals based on the number of tracked packages (15-60 min)
+- Rich embeds with progress bar, tracking history, route, current location, and ETA countdown
+- Package labels/nicknames shown in embeds (e.g., "Jordan 4s for @user")
+- Smart input parsing: accepts `Name : TrackingNumber` format for automatic labeling
+- DM support: static embeds in user-to-user DMs with opt-in live updates via bot DM
+- "Confirm Received" button on delivered packages prompting customers to leave a vouch
+- "Get Live Updates" / "Stop Live Updates" buttons for customer-controlled DM tracking
+- Automatic DM notifications to owner for deliveries, alerts, and status changes
+- 3-tier priority polling: high (10 min), normal (30 min), low (60 min)
+- Activity logging to a Discord channel (new tracks, deliveries, status changes, errors)
+- Shipping statistics with historical delivery data
 - Auto-removal of delivered/returned packages after notification
+- Periodic backups of tracking data (every 6 hours, keeps last 10)
+- Graceful shutdown with state save
 
 **Commands:**
 
 | Command | Description | Permission |
 |---------|-------------|------------|
-| `/track <tracking_number> <user>` | Start tracking a package for a user (posts a live-updating embed) | Authorized users |
+| `/track <tracking_number> [user] [label]` | Start tracking a package (supports `Name : TN` format) | Authorized users |
+| `/bulktrack <tracking_numbers> [user]` | Track multiple packages at once (comma, space, or `Name : TN` format) | Authorized users |
 | `/untrack <tracking_number>` | Stop tracking a package | Authorized users |
-| `/trackinglist` | Show all currently tracked packages | Authorized users |
+| `/trackinglist` | Show all tracked packages (paginated, 8 per page) | Authorized users |
 | `/trackinfo <tracking_number>` | Get current tracking details for any tracking number | Authorized users |
-| `/trackrefresh` | Force refresh all tracked packages immediately | Authorized users |
+| `/trackrefresh [tracking_number] [user]` | Force refresh all, one, or a user's packages | Authorized users |
+| `/stats` | Show shipping statistics (active, delivered, avg delivery time) | Authorized users |
 
 ### Address Parsing
 
@@ -89,6 +98,9 @@ NOTIFICATION_CHANNEL_ID=channel_for_vouch_notifications
 
 USPS_CONSUMER_KEY=your_usps_consumer_key
 USPS_CONSUMER_SECRET=your_usps_consumer_secret
+
+# Optional: persistent data directory (e.g., Railway Volume mount)
+DATA_PATH=/path/to/persistent/data
 ```
 
 ### Installation
@@ -100,7 +112,9 @@ python bot.py
 
 ### Deployment
 
-A `Procfile` is included for deploying to platforms like Heroku or Railway.
+A `Procfile` is included for deploying to platforms like Railway or Heroku.
+
+For persistent data on Railway, create a Volume and set `DATA_PATH` to the mount path.
 
 ## Project Structure
 
@@ -111,12 +125,15 @@ zrbot/
 ├── requirements.txt          # Python dependencies
 ├── Procfile                  # Deployment process file
 ├── commands/
-│   ├── tracking.py           # /track, /untrack, /trackinglist, etc.
+│   ├── tracking.py           # /track, /bulktrack, /untrack, /trackinglist, etc.
 │   └── address.py            # Address-to-CSV context menu command
 ├── utils/
 │   ├── tracking_monitor.py   # USPS polling, embeds, and notifications
 │   └── address_parser.py     # Address parsing and USPS validation
-└── data/                     # Auto-created runtime data
+├── assets/                   # Static assets (USPS logos)
+└── data/                     # Auto-created runtime data (gitignored)
     ├── vouches.json
-    └── tracking.json
+    ├── tracking.json
+    ├── stats.json
+    └── backups/              # Periodic tracking backups
 ```
