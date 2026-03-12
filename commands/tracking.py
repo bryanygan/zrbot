@@ -128,7 +128,12 @@ def setup(bot: commands.Bot):
 
         if is_dm:
             # DM context: static embed with opt-in for live updates
-            embed.set_footer(text="USPS Tracking \u2022 Use 'Get Live Updates' for automatic updates")
+            embed.add_field(
+                name="\u26a0\ufe0f DM Limitation",
+                value="This tracking message **will not update automatically** due to Discord limitations.\nClick the **Get Live Updates** button below to receive live updates in DMs.",
+                inline=False,
+            )
+            embed.set_footer(text="USPS Tracking \u2022 DM messages are static")
             view = build_dm_tracking_view(tn)
             msg = await interaction.followup.send(embed=embed, view=view, wait=True)
             # Store without channel/message so we don't try to edit in user-user DM
@@ -472,7 +477,12 @@ def setup(bot: commands.Bot):
             embed = build_tracking_embed(tn, result, user_id, logo_url=USPS_LOGO_URL, package_label=parsed_label)
 
             if is_dm:
-                embed.set_footer(text="USPS Tracking \u2022 Use 'Get Live Updates' for automatic updates")
+                embed.add_field(
+                    name="\u26a0\ufe0f DM Limitation",
+                    value="This tracking message **will not update automatically** due to Discord limitations.\nClick the **Get Live Updates** button below to receive live updates in a server channel.",
+                    inline=False,
+                )
+                embed.set_footer(text="USPS Tracking \u2022 DM messages are static")
                 view = build_dm_tracking_view(tn)
                 msg = await interaction.followup.send(embed=embed, view=view, wait=True)
                 await monitor.add(tn, user_id, channel_id=None, message_id=None, label=parsed_label)
