@@ -235,8 +235,6 @@ def _extract_inline_address(line: str):
 
     # 3. Street / city split
     street, city = _split_street_city(remaining)
-    if not street or not city:
-        return None
 
     # 4. If "city" starts with an apt marker, extract street2
     street2 = ''
@@ -249,7 +247,23 @@ def _extract_inline_address(line: str):
             street2 = apt_m.group(1).strip()
             city = city[apt_m.end():].strip().lstrip(',').strip()
 
-    if not city:
+    # 4b. If _split_street_city couldn't find a split point (no street suffix),
+    # try splitting on an embedded apt/unit marker instead.
+    # e.g. "679 waring Apt 4A Bronx" → street="679 waring", street2="Apt 4A", city="Bronx"
+    if not city and street:
+        apt_m = re.search(
+            r'\b((?:apt|apartment|suite|ste|unit)\.?\s*#?\s*\w+)\s*[,;]?\s*',
+            street, re.IGNORECASE,
+        )
+        if apt_m:
+            candidate_street = street[:apt_m.start()].strip()
+            after_apt = street[apt_m.end():].strip().lstrip(',').strip()
+            if candidate_street and after_apt:
+                street = candidate_street
+                street2 = apt_m.group(1).strip()
+                city = after_apt
+
+    if not street or not city:
         return None
 
     return {
