@@ -51,6 +51,8 @@ def _is_authorized(interaction: discord.Interaction) -> bool:
 
 def setup(bot: commands.Bot):
     @bot.tree.context_menu(name="Convert Address to CSV")
+    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
     async def convert_address_to_csv(
         interaction: discord.Interaction, message: discord.Message
     ):
