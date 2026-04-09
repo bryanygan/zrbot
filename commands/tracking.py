@@ -111,7 +111,7 @@ def setup(bot: commands.Bot):
 
         result = await monitor.check_single(tn)
 
-        from utils.tracking_monitor import build_tracking_embed, build_tracking_view, build_dm_tracking_view, _save_tracking, _log_to_channel, USPS_LOGO_URL
+        from utils.tracking_monitor import build_tracking_embed, build_dm_tracking_embed, build_tracking_view, build_dm_tracking_view, _save_tracking, _log_to_channel, USPS_LOGO_URL
 
         usps_not_found = not result or "error" in result or result.get("statusCode") == "404"
 
@@ -124,22 +124,17 @@ def setup(bot: commands.Bot):
             }
 
         is_dm = interaction.guild is None
-        embed = build_tracking_embed(tn, result, user_id, logo_url=USPS_LOGO_URL, package_label=label)
 
         if is_dm:
-            # DM context: static embed with opt-in for live updates
-            embed.add_field(
-                name="\u26a0\ufe0f DM Limitation",
-                value="This tracking message **will not update automatically** due to Discord limitations.\nClick the **Get Live Updates** button below to receive live updates in DMs.",
-                inline=False,
-            )
-            embed.set_footer(text="USPS Tracking \u2022 DM messages are static")
+            # DM context: compact embed with opt-in for live updates
+            embed = build_dm_tracking_embed(tn, result, user_id, package_label=label)
             view = build_dm_tracking_view(tn)
             msg = await interaction.followup.send(embed=embed, view=view, wait=True)
             # Store without channel/message so we don't try to edit in user-user DM
             await monitor.add(tn, user_id, channel_id=None, message_id=None, label=label)
         else:
             # Channel context: live-updating embed
+            embed = build_tracking_embed(tn, result, user_id, logo_url=USPS_LOGO_URL, package_label=label)
             view = build_tracking_view(tn)
             msg = await interaction.followup.send(embed=embed, view=view, wait=True)
             await monitor.add(tn, user_id, channel_id=msg.channel.id, message_id=msg.id, label=label)
@@ -454,7 +449,7 @@ def setup(bot: commands.Bot):
 
         await interaction.response.defer(ephemeral=False)
 
-        from utils.tracking_monitor import build_tracking_embed, build_tracking_view, build_dm_tracking_view, _save_tracking, _log_to_channel, USPS_LOGO_URL
+        from utils.tracking_monitor import build_tracking_embed, build_dm_tracking_embed, build_tracking_view, build_dm_tracking_view, _save_tracking, _log_to_channel, USPS_LOGO_URL
 
         is_dm = interaction.guild is None
         added = []
@@ -474,19 +469,13 @@ def setup(bot: commands.Bot):
                     "trackingEvents": [],
                 }
 
-            embed = build_tracking_embed(tn, result, user_id, logo_url=USPS_LOGO_URL, package_label=parsed_label)
-
             if is_dm:
-                embed.add_field(
-                    name="\u26a0\ufe0f DM Limitation",
-                    value="This tracking message **will not update automatically** due to Discord limitations.\nClick the **Get Live Updates** button below to receive live updates in a server channel.",
-                    inline=False,
-                )
-                embed.set_footer(text="USPS Tracking \u2022 DM messages are static")
+                embed = build_dm_tracking_embed(tn, result, user_id, package_label=parsed_label)
                 view = build_dm_tracking_view(tn)
                 msg = await interaction.followup.send(embed=embed, view=view, wait=True)
                 await monitor.add(tn, user_id, channel_id=None, message_id=None, label=parsed_label)
             else:
+                embed = build_tracking_embed(tn, result, user_id, logo_url=USPS_LOGO_URL, package_label=parsed_label)
                 view = build_tracking_view(tn)
                 msg = await interaction.followup.send(embed=embed, view=view, wait=True)
                 await monitor.add(tn, user_id, channel_id=msg.channel.id, message_id=msg.id, label=parsed_label)

@@ -421,6 +421,96 @@ def build_dm_tracking_view(tracking_number: str) -> discord.ui.View:
     return view
 
 
+def build_dm_tracking_embed(
+    tracking_number: str,
+    data: dict,
+    user_id: int | None = None,
+    *,
+    package_label: str | None = None,
+) -> discord.Embed:
+    """Build a compact embed for DM context where messages are static."""
+    category = data.get("statusCategory", "Unknown")
+    color, emoji, label = STATUS_CONFIG.get(category, DEFAULT_STATUS_CONFIG)
+
+    summary = data.get("statusSummary", "")
+    delivery_info = data.get("deliveryDateExpectation", {})
+
+    # Compact description: summary + note about live updates
+    desc_parts = []
+    if summary:
+        desc_parts.append(summary)
+    desc_parts.append(
+        "\n*This message won't update automatically. "
+        "Click **Get Live Updates** below for real-time tracking.*"
+    )
+
+    embed = discord.Embed(
+        title=f"{emoji}  {label}",
+        description="\n".join(desc_parts),
+        color=color,
+        url=f"{USPS_TRACKING_PAGE}{tracking_number}",
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    # Key fields only — no history, location, transit days, or progress bar
+    embed.add_field(
+        name="Tracking #",
+        value=f"[`{tracking_number}`]({USPS_TRACKING_PAGE}{tracking_number})",
+        inline=True,
+    )
+    mail_class = _clean_mail_class(data.get("mailClass", ""))
+    if mail_class:
+        embed.add_field(name="Service", value=mail_class, inline=True)
+    if user_id:
+        embed.add_field(name="Recipient", value=f"<@{user_id}>", inline=True)
+    if package_label:
+        embed.add_field(name="Package", value=package_label, inline=True)
+
+    # Route
+    origin_city = data.get("originCity", "")
+    origin_state = data.get("originState", "")
+    dest_city = data.get("destinationCity", "")
+    dest_state = data.get("destinationState", "")
+    origin = f"{origin_city.title()}, {origin_state}" if origin_city and origin_state else ""
+    dest = f"{dest_city.title()}, {dest_state}" if dest_city and dest_state else ""
+    if origin or dest:
+        embed.add_field(
+            name="Route",
+            value=f"{origin or 'Unknown'} → {dest or 'Unknown'}",
+            inline=True,
+        )
+
+    # Expected delivery
+    exp_date = delivery_info.get("expectedDeliveryDate") or delivery_info.get("predictedDeliveryDate")
+    if exp_date and category not in TERMINAL_CATEGORIES:
+        try:
+            dt = datetime.strptime(exp_date, "%Y-%m-%d")
+            delivery_text = f"<t:{int(dt.timestamp())}:D>"
+            delivery_time = (
+                delivery_info.get("expectedDeliveryTime")
+                or delivery_info.get("predictedDeliveryEndTime")
+                or ""
+            )
+            if delivery_time:
+                delivery_text += f" by {delivery_time}"
+            countdown = _build_eta_countdown(delivery_info, category)
+            if countdown:
+                delivery_text += f"\n{countdown}"
+            embed.add_field(name="Expected Delivery", value=delivery_text, inline=True)
+        except ValueError:
+            embed.add_field(name="Expected Delivery", value=exp_date, inline=True)
+
+    if category == "Delivered":
+        embed.add_field(
+            name="Thank You!",
+            value="Please leave a vouch if your package arrived safe! If you have any questions/concerns about the package, please feel free to reach out!",
+            inline=False,
+        )
+
+    embed.set_footer(text="USPS Tracking • Click Get Live Updates for real-time tracking")
+    return embed
+
+
 def build_tracking_embed(
     tracking_number: str,
     data: dict,
