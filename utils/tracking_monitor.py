@@ -34,6 +34,12 @@ USPS_TOKEN_URL = "https://api.usps.com/oauth2/v3/token"
 USPS_TRACKING_URL = "https://apis.usps.com/tracking/v3r2/tracking"
 BATCH_SIZE = 35  # USPS max per request
 
+# 17track fallback API
+TRACK17_API_KEY = os.environ.get("TRACK17_API_KEY", "")
+TRACK17_REGISTER_URL = "https://api.17track.net/track/v2.2/register"
+TRACK17_GETTRACK_URL = "https://api.17track.net/track/v2.2/gettrackinfo"
+USPS_CARRIER_17TRACK = 21051
+
 BASE_POLL_MINUTES = 30
 MIN_POLL_MINUTES = 15
 MAX_POLL_MINUTES = 60
@@ -232,6 +238,159 @@ class RateLimitError(Exception):
     def __init__(self, retry_after: int):
         self.retry_after = retry_after
         super().__init__(f"Rate limited for {retry_after}s")
+
+
+# ---------------------------------------------------------------------------
+# 17track fallback API
+# ---------------------------------------------------------------------------
+
+# 17track package_status → our statusCategory
+_17TRACK_STATUS_MAP = {
+    0: "Waiting for USPS",      # Not Found
+    10: "In Transit",           # In Transit
+    20: "Alert",                # Expired
+    30: "Delivery Attempt",     # Pick Up
+    35: "Alert",                # Undelivered / Alert
+    40: "Delivered",            # Delivered
+    50: "Return to Sender",     # Returned
+}
+
+
+async def _register_17track(tracking_numbers: list[str]) -> None:
+    """Register tracking numbers with 17track (idempotent)."""
+    payload = [
+        {"number": tn, "carrier": USPS_CARRIER_17TRACK, "auto_detection": True}
+        for tn in tracking_numbers
+    ]
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            TRACK17_REGISTER_URL,
+            headers={"17token": TRACK17_API_KEY, "Content-Type": "application/json"},
+            json=payload,
+        ) as resp:
+            body = await resp.json()
+            rejected = body.get("data", {}).get("rejected", [])
+            if rejected:
+                logger.warning("17track register rejected: %s", rejected)
+
+
+async def _fetch_tracking_17track(tracking_numbers: list[str]) -> list[dict]:
+    """Fetch tracking via 17track and convert to USPS-compatible format."""
+    if not TRACK17_API_KEY:
+        return []
+
+    # Register first (idempotent — already-registered numbers are fine)
+    await _register_17track(tracking_numbers)
+    # Small delay to let 17track process newly registered numbers
+    await asyncio.sleep(1)
+
+    payload = [{"number": tn, "carrier": USPS_CARRIER_17TRACK} for tn in tracking_numbers]
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            TRACK17_GETTRACK_URL,
+            headers={"17token": TRACK17_API_KEY, "Content-Type": "application/json"},
+            json=payload,
+        ) as resp:
+            body = await resp.json()
+
+    results = []
+    for item in body.get("data", {}).get("accepted", []):
+        converted = _convert_17track_to_usps(item)
+        if converted:
+            results.append(converted)
+    return results
+
+
+async def _fetch_tracking_17track_raw(tracking_numbers: list[str]) -> dict:
+    """Fetch raw 17track API response (for debugging)."""
+    if not TRACK17_API_KEY:
+        return {"error": "TRACK17_API_KEY not set"}
+
+    await _register_17track(tracking_numbers)
+    await asyncio.sleep(1)
+
+    payload = [{"number": tn, "carrier": USPS_CARRIER_17TRACK} for tn in tracking_numbers]
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            TRACK17_GETTRACK_URL,
+            headers={"17token": TRACK17_API_KEY, "Content-Type": "application/json"},
+            json=payload,
+        ) as resp:
+            return await resp.json()
+
+
+def _convert_17track_to_usps(item: dict) -> dict | None:
+    """Convert a 17track gettrackinfo item to USPS-compatible format."""
+    number = item.get("number", "")
+    if not number:
+        return None
+
+    package_status = item.get("package_status", 0)
+    category = _17TRACK_STATUS_MAP.get(package_status, "Unknown")
+
+    # Extract latest event info from the tracking data
+    providers = item.get("providers", [])
+    events_raw = []
+    for provider in providers:
+        for ev in provider.get("events", []):
+            events_raw.append(ev)
+
+    # Also check track_info.latest_event as a fallback
+    latest = item.get("latest_event", {})
+
+    # Convert events to USPS-compatible format
+    tracking_events = []
+    for ev in events_raw:
+        time_iso = ev.get("time_iso") or ev.get("time_utc") or ev.get("d") or ""
+        description = ev.get("description") or ev.get("z") or ""
+        location = ev.get("location") or ev.get("a") or ""
+
+        # Parse location into city/state/zip
+        city, state, zip_code = "", "", ""
+        if location:
+            parts = [p.strip() for p in location.replace(",", " ").split()]
+            # Try to find state (2-letter code) and zip (5 digits)
+            for i, p in enumerate(parts):
+                if len(p) == 2 and p.isalpha() and p.isupper():
+                    state = p
+                    city = " ".join(parts[:i])
+                elif len(p) == 5 and p.isdigit():
+                    zip_code = p
+
+        tracking_events.append({
+            "eventType": description,
+            "eventTimestamp": time_iso,
+            "eventCity": city,
+            "eventState": state,
+            "eventZIPCode": zip_code,
+        })
+
+    # Build status summary from latest event
+    status_summary = ""
+    if latest:
+        status_summary = latest.get("description") or latest.get("z") or ""
+    elif tracking_events:
+        status_summary = tracking_events[0].get("eventType", "")
+
+    # Build a status string
+    status = category
+    if status_summary:
+        status = status_summary
+
+    result = {
+        "trackingNumber": number.upper(),
+        "statusCategory": category,
+        "status": status,
+        "statusSummary": status_summary or f"Status: {category}",
+        "trackingEvents": tracking_events,
+        "mailClass": "",
+        "originCity": "",
+        "originState": "",
+        "destinationCity": item.get("destination_country", ""),
+        "destinationState": "",
+        "_source": "17track",
+    }
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -788,18 +947,36 @@ class TrackingMonitor:
         return dict(self.tracking_data)
 
     async def check_single(self, tracking_number: str) -> dict | None:
-        """Fetch tracking for a single number. Returns API response or None."""
+        """Fetch tracking for a single number. Falls back to 17track if USPS fails."""
+        tn = tracking_number.upper()
+        # Try USPS first
         try:
             results = await _fetch_tracking_batch(
-                [tracking_number], self.consumer_key, self.consumer_secret,
+                [tn], self.consumer_key, self.consumer_secret,
             )
             for r in results:
-                if r.get("trackingNumber", "").upper() == tracking_number.upper():
-                    return r
-            return results[0] if results else None
+                if r.get("trackingNumber", "").upper() == tn:
+                    # Check if USPS returned an error for this specific number
+                    if "error" not in r and r.get("statusCode") != "404":
+                        return r
+            if results and "error" not in results[0] and results[0].get("statusCode") != "404":
+                return results[0] if results else None
         except Exception as exc:
-            logger.warning("Failed to check %s: %s", tracking_number, exc)
-            return None
+            logger.warning("USPS check failed for %s: %s", tn, exc)
+
+        # Fallback to 17track
+        if TRACK17_API_KEY:
+            try:
+                logger.info("Falling back to 17track for %s", tn)
+                results = await _fetch_tracking_17track([tn])
+                for r in results:
+                    if r.get("trackingNumber", "").upper() == tn:
+                        return r
+                return results[0] if results else None
+            except Exception as exc:
+                logger.warning("17track check failed for %s: %s", tn, exc)
+
+        return None
 
     # -- Background loop --
 
@@ -867,28 +1044,33 @@ class TrackingMonitor:
                      len(normal_numbers) if due_for_full_poll else 0,
                      len(low_priority_numbers) if due_for_low_poll else 0)
 
-        # Process in batches of 35
+        # Process in batches (35 for USPS, 40 for 17track)
         for batch_start in range(0, len(tracking_numbers), BATCH_SIZE):
             batch = tracking_numbers[batch_start:batch_start + BATCH_SIZE]
+            usps_failed = False
             try:
                 results = await _fetch_tracking_batch(
                     batch, self.consumer_key, self.consumer_secret,
                 )
+                # Check if ALL results are errors (e.g. USPS 403 access block)
+                if results and all("error" in r or r.get("statusCode") == "404" for r in results):
+                    usps_failed = True
             except RateLimitError as e:
                 logger.warning("Rate limited, skipping remaining batches. Retry in %ds", e.retry_after)
-                await self._dm_owner_error(
-                    "USPS Rate Limited",
-                    f"Rate limited by USPS API. Retry after **{e.retry_after}s**.\n"
-                    f"Skipped remaining batches ({len(tracking_numbers) - batch_start} packages unpolled).",
-                )
                 return
             except Exception as exc:
-                logger.error("Batch fetch error: %s", exc)
-                await self._dm_owner_error(
-                    "USPS API Error",
-                    f"Batch fetch failed for {len(batch)} packages:\n```{exc}```",
-                )
-                continue
+                logger.error("USPS batch fetch error: %s", exc)
+                usps_failed = True
+                results = []
+
+            # Fall back to 17track if USPS failed for the whole batch
+            if usps_failed and TRACK17_API_KEY:
+                try:
+                    logger.info("USPS failed for batch, falling back to 17track (%d packages)", len(batch))
+                    results = await _fetch_tracking_17track(batch)
+                except Exception as exc:
+                    logger.error("17track batch fetch also failed: %s", exc)
+                    results = []
 
             for result in results:
                 tn = result.get("trackingNumber", "").upper()

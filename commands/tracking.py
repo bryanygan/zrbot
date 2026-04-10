@@ -632,9 +632,12 @@ def setup(bot: commands.Bot):
             )
 
         if api_test:
-            # Call USPS API directly and show raw response
+            # Call both USPS and 17track APIs and show raw responses
             await interaction.response.defer(ephemeral=True)
             tn = api_test.strip().upper()
+            parts = []
+
+            # USPS
             try:
                 from utils.tracking_monitor import _get_usps_token, USPS_TRACKING_URL
                 import aiohttp
@@ -649,11 +652,28 @@ def setup(bot: commands.Bot):
                         },
                         json=payload,
                     ) as resp:
-                        status = resp.status
-                        body = await resp.text()
-                output = f"**Status:** {status}\n**URL:** `{USPS_TRACKING_URL}`\n**Response:**\n```json\n{body[:3800]}\n```"
+                        usps_status = resp.status
+                        usps_body = await resp.text()
+                parts.append(f"**USPS** (HTTP {usps_status}):\n```json\n{usps_body[:1800]}\n```")
             except Exception as exc:
-                output = f"**Error:** `{exc}`"
+                parts.append(f"**USPS Error:** `{exc}`")
+
+            # 17track
+            try:
+                from utils.tracking_monitor import _fetch_tracking_17track_raw
+                raw_17 = await _fetch_tracking_17track_raw([tn])
+                body_17 = json.dumps(raw_17, indent=2)
+                parts.append(f"**17track:**\n```json\n{body_17[:1800]}\n```")
+            except Exception as exc:
+                parts.append(f"**17track Error:** `{exc}`")
+
+            output = "\n".join(parts)
+            if len(output) > 1900:
+                file = discord.File(
+                    fp=__import__("io").BytesIO(output.encode()),
+                    filename=f"api_test_{tn}.txt",
+                )
+                return await interaction.followup.send(file=file, ephemeral=True)
             return await interaction.followup.send(output, ephemeral=True)
 
         if raw:
