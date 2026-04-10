@@ -532,6 +532,17 @@ async def on_ready():
     total = sum(all_vouches.values())
     logger.info("Vouches loaded: %d total across %d users", total, len(all_vouches))
 
+    # Pre-register all tracked packages with TrackingMore so data is ready for fallback
+    if bot.tracking_monitor and bot.tracking_monitor.tracking_data:
+        from utils.tracking_monitor import TRACKINGMORE_API_KEY, _trackingmore_create
+        if TRACKINGMORE_API_KEY:
+            all_tns = list(bot.tracking_monitor.tracking_data.keys())
+            try:
+                await _trackingmore_create(all_tns)
+                logger.info("Pre-registered %d packages with TrackingMore", len(all_tns))
+            except Exception as exc:
+                logger.warning("Failed to pre-register with TrackingMore: %s", exc)
+
     # Log startup to activity channel
     from utils.tracking_monitor import _log_to_channel
     tracking_count = len(bot.tracking_monitor.tracking_data) if bot.tracking_monitor else 0

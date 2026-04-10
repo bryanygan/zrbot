@@ -1,5 +1,6 @@
 """Slash commands for USPS package tracking."""
 
+import asyncio
 import json
 import re
 
@@ -207,6 +208,11 @@ def setup(bot: commands.Bot):
         entry["last_status_category"] = result.get("statusCategory")
         entry["last_status"] = result.get("status")
         _save_tracking(monitor.tracking_data)
+
+        # Pre-register with TrackingMore so fallback data is ready
+        from utils.tracking_monitor import TRACKINGMORE_API_KEY, _trackingmore_create
+        if TRACKINGMORE_API_KEY:
+            asyncio.get_event_loop().create_task(_trackingmore_create([tn]))
 
         # Log to activity channel
         pkg_display = label or tn
