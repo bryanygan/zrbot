@@ -281,17 +281,30 @@ async def _fetch_tracking_17track(tracking_numbers: list[str]) -> list[dict]:
 
     # Register first (idempotent — already-registered numbers are fine)
     await _register_17track(tracking_numbers)
-    # Small delay to let 17track process newly registered numbers
-    await asyncio.sleep(1)
+    # 17track needs time to fetch data from the carrier after registration
+    await asyncio.sleep(3)
 
     payload = [{"number": tn, "carrier": USPS_CARRIER_17TRACK} for tn in tracking_numbers]
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            TRACK17_GETTRACK_URL,
-            headers={"17token": TRACK17_API_KEY, "Content-Type": "application/json"},
-            json=payload,
-        ) as resp:
-            body = await resp.json()
+
+    # Query, retry once if numbers aren't ready yet
+    for attempt in range(2):
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                TRACK17_GETTRACK_URL,
+                headers={"17token": TRACK17_API_KEY, "Content-Type": "application/json"},
+                json=payload,
+            ) as resp:
+                body = await resp.json()
+
+        rejected = body.get("data", {}).get("rejected", [])
+        accepted = body.get("data", {}).get("accepted", [])
+
+        # If all rejected with "not registered" and this is the first attempt, wait and retry
+        if rejected and not accepted and attempt == 0:
+            logger.info("17track numbers not ready yet, retrying in 5s...")
+            await asyncio.sleep(5)
+            continue
+        break
 
     results = []
     for item in body.get("data", {}).get("accepted", []):
@@ -302,21 +315,37 @@ async def _fetch_tracking_17track(tracking_numbers: list[str]) -> list[dict]:
 
 
 async def _fetch_tracking_17track_raw(tracking_numbers: list[str]) -> dict:
-    """Fetch raw 17track API response (for debugging)."""
+    """Fetch raw 17track API response (for debugging). Shows both register and query."""
     if not TRACK17_API_KEY:
         return {"error": "TRACK17_API_KEY not set"}
 
-    await _register_17track(tracking_numbers)
-    await asyncio.sleep(1)
+    # Register and capture the response
+    reg_payload = [
+        {"number": tn, "carrier": USPS_CARRIER_17TRACK, "auto_detection": True}
+        for tn in tracking_numbers
+    ]
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            TRACK17_REGISTER_URL,
+            headers={"17token": TRACK17_API_KEY, "Content-Type": "application/json"},
+            json=reg_payload,
+        ) as resp:
+            register_resp = await resp.json()
 
-    payload = [{"number": tn, "carrier": USPS_CARRIER_17TRACK} for tn in tracking_numbers]
+    # Wait for 17track to fetch carrier data
+    await asyncio.sleep(5)
+
+    # Query tracking info
+    query_payload = [{"number": tn, "carrier": USPS_CARRIER_17TRACK} for tn in tracking_numbers]
     async with aiohttp.ClientSession() as session:
         async with session.post(
             TRACK17_GETTRACK_URL,
             headers={"17token": TRACK17_API_KEY, "Content-Type": "application/json"},
-            json=payload,
+            json=query_payload,
         ) as resp:
-            return await resp.json()
+            query_resp = await resp.json()
+
+    return {"register": register_resp, "gettrackinfo": query_resp}
 
 
 def _convert_17track_to_usps(item: dict) -> dict | None:
