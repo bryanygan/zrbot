@@ -895,11 +895,24 @@ class TrackingMonitor:
                 if tn not in self.tracking_data:
                     continue
 
+                entry = self.tracking_data[tn]
+
                 # Check for API-level errors on this tracking number
-                if "error" in result or result.get("statusCode") == "404":
+                usps_error = "error" in result or result.get("statusCode") == "404"
+
+                if usps_error:
+                    # Still refresh the embed timestamp so it's clear the bot is checking
+                    entry["last_checked_at"] = datetime.now(timezone.utc).isoformat()
+                    if entry.get("channel_id") and entry.get("message_id"):
+                        fallback = {
+                            "statusCategory": entry.get("last_status_category") or "Waiting for USPS",
+                            "status": entry.get("last_status") or "Waiting for USPS",
+                            "statusSummary": "Label has been created but USPS hasn't registered this package yet. It will update automatically once USPS scans it.",
+                            "trackingEvents": [],
+                        }
+                        await self._update_channel_embed(tn, entry, fallback)
                     continue
 
-                entry = self.tracking_data[tn]
                 new_category = result.get("statusCategory", "")
                 old_category = entry.get("last_status_category")
 
