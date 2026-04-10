@@ -8,7 +8,7 @@ from discord import app_commands
 from discord.ext import commands
 from datetime import datetime, timezone
 
-from config import AUTHORIZED_IDS
+from config import AUTHORIZED_IDS, OWNER_ID
 
 
 def _is_authorized(interaction: discord.Interaction) -> bool:
@@ -569,3 +569,85 @@ def setup(bot: commands.Bot):
 
         embed.set_footer(text=f"Polling every {monitor._poll_interval_minutes} min")
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @bot.tree.command(name="trackdata", description="Inspect raw tracking data (owner only)")
+    @app_commands.allowed_installs(guilds=True, users=True)
+    @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+    @app_commands.describe(
+        tracking_number="Show data for a specific tracking number",
+        raw="Dump the full tracking.json file",
+    )
+    async def trackdata_command(
+        interaction: discord.Interaction,
+        tracking_number: str = None,
+        raw: bool = False,
+    ):
+        if interaction.user.id != OWNER_ID:
+            return await interaction.response.send_message(
+                "Owner only.", ephemeral=True
+            )
+
+        monitor = getattr(bot, "tracking_monitor", None)
+        if not monitor:
+            return await interaction.response.send_message(
+                "Tracking monitor is not configured.", ephemeral=True
+            )
+
+        if raw:
+            # Dump full tracking.json as a file attachment
+            from utils.tracking_monitor import TRACKING_FILE
+            if not TRACKING_FILE.exists():
+                return await interaction.response.send_message(
+                    "tracking.json not found.", ephemeral=True
+                )
+            content = TRACKING_FILE.read_text()
+            file = discord.File(
+                fp=__import__("io").BytesIO(content.encode()),
+                filename="tracking.json",
+            )
+            return await interaction.response.send_message(
+                file=file, ephemeral=True
+            )
+
+        if tracking_number:
+            tn = tracking_number.strip().upper()
+            entry = monitor.tracking_data.get(tn)
+            if not entry:
+                return await interaction.response.send_message(
+                    f"`{tn}` not found in tracking data.", ephemeral=True
+                )
+            formatted = json.dumps({tn: entry}, indent=2)
+            if len(formatted) > 1900:
+                file = discord.File(
+                    fp=__import__("io").BytesIO(formatted.encode()),
+                    filename=f"{tn}.json",
+                )
+                return await interaction.response.send_message(
+                    file=file, ephemeral=True
+                )
+            return await interaction.response.send_message(
+                f"```json\n{formatted}\n```", ephemeral=True
+            )
+
+        # Default: summary of each entry's key fields
+        lines = []
+        for tn, entry in monitor.tracking_data.items():
+            ch = entry.get("channel_id")
+            msg = entry.get("message_id")
+            cat = entry.get("last_status_category") or "None"
+            checked = entry.get("last_checked_at") or "never"
+            label = entry.get("label") or ""
+            name = f"**{label}** " if label else ""
+            embed_status = f"ch={ch} msg={msg}" if ch and msg else "no embed"
+            lines.append(f"{name}`{tn}` — {cat} — {embed_status} — checked: {checked}")
+
+        text = "\n".join(lines) if lines else "No packages tracked."
+        if len(text) > 1900:
+            file = discord.File(
+                fp=__import__("io").BytesIO(text.encode()),
+                filename="trackdata_summary.txt",
+            )
+            return await interaction.response.send_message(
+                file=file, ephemeral=True
+            )
+        await interaction.response.send_message(text, ephemeral=True)
