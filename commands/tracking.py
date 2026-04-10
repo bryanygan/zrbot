@@ -319,9 +319,65 @@ def setup(bot: commands.Bot):
                 return await interaction.followup.send(f"`{tn}` is not being tracked.", ephemeral=True)
 
             result = await monitor.check_single(tn)
-            if result and "error" not in result and result.get("statusCode") != "404":
+            usps_error = not result or "error" in result or result.get("statusCode") == "404"
+            if usps_error:
+                result = {
+                    "statusCategory": entry.get("last_status_category") or "Waiting for USPS",
+                    "status": entry.get("last_status") or "Waiting for USPS",
+                    "statusSummary": "Label has been created but USPS hasn't registered this package yet. It will update automatically once USPS scans it.",
+                    "trackingEvents": [],
+                }
+            else:
                 entry["last_status_category"] = result.get("statusCategory", "")
                 entry["last_status"] = result.get("status", "")
+
+            entry["last_checked_at"] = datetime.now(timezone.utc).isoformat()
+            if entry.get("channel_id") and entry.get("message_id"):
+                category = result.get("statusCategory", "")
+                is_delivered = category == "Delivered"
+                try:
+                    channel = bot.get_channel(entry["channel_id"]) or await bot.fetch_channel(entry["channel_id"])
+                    message = await channel.fetch_message(entry["message_id"])
+                    embed = build_tracking_embed(tn, result, entry.get("user_id"), logo_url=USPS_LOGO_URL, package_label=entry.get("label"))
+                    view = build_tracking_view(tn, delivered=is_delivered)
+                    await message.edit(embed=embed, view=view)
+                except (discord.NotFound, discord.Forbidden) as exc:
+                    entry["channel_id"] = None
+                    entry["message_id"] = None
+                    _save_tracking(monitor.tracking_data)
+                    return await interaction.followup.send(
+                        f"Message for `{tn}` is gone (deleted or no access). Cleared embed link.", ephemeral=True
+                    )
+                except Exception as exc:
+                    return await interaction.followup.send(
+                        f"Failed to update embed for `{tn}`: {exc}", ephemeral=True
+                    )
+            _save_tracking(monitor.tracking_data)
+            status = " (USPS has no data yet)" if usps_error else ""
+            await interaction.followup.send(f"Refreshed `{tn}`{status}.", ephemeral=True)
+
+        elif user:
+            # Refresh all packages for a specific user
+            user_packages = {tn: e for tn, e in monitor.tracking_data.items() if e.get("user_id") == user.id}
+            if not user_packages:
+                return await interaction.followup.send(f"No packages tracked for {user.mention}.", ephemeral=True)
+
+            refreshed = 0
+            failed = 0
+            for tn, entry in user_packages.items():
+                result = await monitor.check_single(tn)
+                usps_error = not result or "error" in result or result.get("statusCode") == "404"
+                if usps_error:
+                    result = {
+                        "statusCategory": entry.get("last_status_category") or "Waiting for USPS",
+                        "status": entry.get("last_status") or "Waiting for USPS",
+                        "statusSummary": "Label has been created but USPS hasn't registered this package yet.",
+                        "trackingEvents": [],
+                    }
+                else:
+                    entry["last_status_category"] = result.get("statusCategory", "")
+                    entry["last_status"] = result.get("status", "")
+
                 entry["last_checked_at"] = datetime.now(timezone.utc).isoformat()
                 if entry.get("channel_id") and entry.get("message_id"):
                     category = result.get("statusCategory", "")
@@ -332,40 +388,20 @@ def setup(bot: commands.Bot):
                         embed = build_tracking_embed(tn, result, entry.get("user_id"), logo_url=USPS_LOGO_URL, package_label=entry.get("label"))
                         view = build_tracking_view(tn, delivered=is_delivered)
                         await message.edit(embed=embed, view=view)
+                    except (discord.NotFound, discord.Forbidden):
+                        entry["channel_id"] = None
+                        entry["message_id"] = None
+                        failed += 1
+                        continue
                     except Exception:
-                        pass
-                _save_tracking(monitor.tracking_data)
-                await interaction.followup.send(f"Refreshed `{tn}`.", ephemeral=True)
-            else:
-                await interaction.followup.send(f"Could not fetch data for `{tn}`.", ephemeral=True)
-
-        elif user:
-            # Refresh all packages for a specific user
-            user_packages = {tn: e for tn, e in monitor.tracking_data.items() if e.get("user_id") == user.id}
-            if not user_packages:
-                return await interaction.followup.send(f"No packages tracked for {user.mention}.", ephemeral=True)
-
-            refreshed = 0
-            for tn, entry in user_packages.items():
-                result = await monitor.check_single(tn)
-                if result and "error" not in result and result.get("statusCode") != "404":
-                    entry["last_status_category"] = result.get("statusCategory", "")
-                    entry["last_status"] = result.get("status", "")
-                    entry["last_checked_at"] = datetime.now(timezone.utc).isoformat()
-                    if entry.get("channel_id") and entry.get("message_id"):
-                        category = result.get("statusCategory", "")
-                        is_delivered = category == "Delivered"
-                        try:
-                            channel = bot.get_channel(entry["channel_id"]) or await bot.fetch_channel(entry["channel_id"])
-                            message = await channel.fetch_message(entry["message_id"])
-                            embed = build_tracking_embed(tn, result, entry.get("user_id"), logo_url=USPS_LOGO_URL, package_label=entry.get("label"))
-                            view = build_tracking_view(tn, delivered=is_delivered)
-                            await message.edit(embed=embed, view=view)
-                        except Exception:
-                            pass
-                    refreshed += 1
+                        failed += 1
+                        continue
+                refreshed += 1
             _save_tracking(monitor.tracking_data)
-            await interaction.followup.send(f"Refreshed **{refreshed}** package(s) for {user.mention}.", ephemeral=True)
+            msg = f"Refreshed **{refreshed}** package(s) for {user.mention}."
+            if failed:
+                msg += f" {failed} embed(s) could not be updated."
+            await interaction.followup.send(msg, ephemeral=True)
 
         else:
             # Refresh all
