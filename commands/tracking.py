@@ -658,14 +658,14 @@ def setup(bot: commands.Bot):
             except Exception as exc:
                 parts.append(f"**USPS Error:** `{exc}`")
 
-            # 17track
+            # TrackingMore
             try:
-                from utils.tracking_monitor import _fetch_tracking_17track_raw
-                raw_17 = await _fetch_tracking_17track_raw([tn])
-                body_17 = json.dumps(raw_17, indent=2)
-                parts.append(f"**17track:**\n```json\n{body_17[:1800]}\n```")
+                from utils.tracking_monitor import _fetch_tracking_trackingmore_raw
+                raw_tm = await _fetch_tracking_trackingmore_raw(tn)
+                body_tm = json.dumps(raw_tm, indent=2)
+                parts.append(f"**TrackingMore:**\n```json\n{body_tm[:1800]}\n```")
             except Exception as exc:
-                parts.append(f"**17track Error:** `{exc}`")
+                parts.append(f"**TrackingMore Error:** `{exc}`")
 
             output = "\n".join(parts)
             if len(output) > 1900:
