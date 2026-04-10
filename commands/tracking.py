@@ -612,11 +612,13 @@ def setup(bot: commands.Bot):
     @app_commands.describe(
         tracking_number="Show data for a specific tracking number",
         raw="Dump the full tracking.json file",
+        api_test="Call USPS API and show the raw response for a tracking number",
     )
     async def trackdata_command(
         interaction: discord.Interaction,
         tracking_number: str = None,
         raw: bool = False,
+        api_test: str = None,
     ):
         if interaction.user.id != OWNER_ID:
             return await interaction.response.send_message(
@@ -628,6 +630,31 @@ def setup(bot: commands.Bot):
             return await interaction.response.send_message(
                 "Tracking monitor is not configured.", ephemeral=True
             )
+
+        if api_test:
+            # Call USPS API directly and show raw response
+            await interaction.response.defer(ephemeral=True)
+            tn = api_test.strip().upper()
+            try:
+                from utils.tracking_monitor import _get_usps_token, USPS_TRACKING_URL
+                import aiohttp
+                token = await _get_usps_token(monitor.consumer_key, monitor.consumer_secret)
+                payload = [{"trackingNumber": tn}]
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        USPS_TRACKING_URL,
+                        headers={
+                            "Authorization": f"Bearer {token}",
+                            "Content-Type": "application/json",
+                        },
+                        json=payload,
+                    ) as resp:
+                        status = resp.status
+                        body = await resp.text()
+                output = f"**Status:** {status}\n**URL:** `{USPS_TRACKING_URL}`\n**Response:**\n```json\n{body[:3800]}\n```"
+            except Exception as exc:
+                output = f"**Error:** `{exc}`"
+            return await interaction.followup.send(output, ephemeral=True)
 
         if raw:
             # Dump full tracking.json as a file attachment
