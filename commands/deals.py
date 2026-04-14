@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -15,8 +16,8 @@ from config import OWNER_ID, AUTHORIZED_IDS
 
 logger = logging.getLogger("zrbot.deals")
 
-# Path to the weekendmaxxing project
-DEAL_HUNTER_PATH = Path(__file__).resolve().parent.parent.parent / "weekendmaxxing"
+# Path to the weekendmaxxing project — configurable via env var or defaults to sibling dir
+DEAL_HUNTER_PATH = Path(os.getenv("DEAL_HUNTER_PATH", Path(__file__).resolve().parent.parent.parent / "weekendmaxxing"))
 DEAL_DB_PATH = DEAL_HUNTER_PATH / "data" / "deals.db"
 
 
