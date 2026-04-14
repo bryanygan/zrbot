@@ -432,9 +432,11 @@ async def on_interaction(interaction: discord.Interaction):
 
 from commands import address as address_commands
 from commands import tracking as tracking_commands
+from commands import deals as deals_commands
 
 address_commands.setup(bot)
 tracking_commands.setup(bot)
+deals_commands.setup(bot)
 
 # Set up tracking monitor if USPS credentials are configured
 if USPS_CONSUMER_KEY and USPS_CONSUMER_SECRET:
