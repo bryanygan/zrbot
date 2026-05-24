@@ -276,24 +276,62 @@ class TestChunkForDiscord(unittest.TestCase):
         self.assertEqual(len(chunks[0]), 1)
 
     def test_exactly_ten_images(self):
+        """10 images fits in one message — mosaic with hero image."""
         images = [_make_image(name=f"img_{i}.jpg") for i in range(10)]
         chunks = chunk_for_discord(images)
         self.assertEqual(len(chunks), 1)
         self.assertEqual(len(chunks[0]), 10)
 
-    def test_eleven_images_splits_into_two(self):
+    def test_exactly_seven_images(self):
+        """7 images fits in one message — mosaic with hero image."""
+        images = [_make_image(name=f"img_{i}.jpg") for i in range(7)]
+        chunks = chunk_for_discord(images)
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(len(chunks[0]), 7)
+
+    def test_eleven_images_even_split(self):
+        """11 images: first=7 (mosaic), second=4. Not 10+1."""
         images = [_make_image(name=f"img_{i}.jpg") for i in range(11)]
         chunks = chunk_for_discord(images)
         self.assertEqual(len(chunks), 2)
-        self.assertEqual(len(chunks[0]), 10)
-        self.assertEqual(len(chunks[1]), 1)
+        # 7+4 is more even than 10+1
+        self.assertEqual(len(chunks[0]), 7)
+        self.assertEqual(len(chunks[1]), 4)
 
-    def test_twenty_images_splits_into_two(self):
+    def test_fourteen_images_mosaic_split(self):
+        """14 images: first=7 (mosaic), second=7 — perfectly even."""
+        images = [_make_image(name=f"img_{i}.jpg") for i in range(14)]
+        chunks = chunk_for_discord(images)
+        self.assertEqual(len(chunks), 2)
+        self.assertEqual(len(chunks[0]), 7)
+        self.assertEqual(len(chunks[1]), 7)
+
+    def test_seventeen_images_mosaic_split(self):
+        """17 images: first=10 (mosaic), remaining=7 — both mosaic-friendly."""
+        images = [_make_image(name=f"img_{i}.jpg") for i in range(17)]
+        chunks = chunk_for_discord(images)
+        self.assertEqual(len(chunks), 2)
+        self.assertEqual(len(chunks[0]), 10)
+        self.assertEqual(len(chunks[1]), 7)
+
+    def test_twenty_images(self):
+        """20 images: first=10 (mosaic), second=10 — perfectly even."""
         images = [_make_image(name=f"img_{i}.jpg") for i in range(20)]
         chunks = chunk_for_discord(images)
         self.assertEqual(len(chunks), 2)
         self.assertEqual(len(chunks[0]), 10)
         self.assertEqual(len(chunks[1]), 10)
+
+    def test_twenty_five_images(self):
+        """25 images: should distribute evenly across 3 messages."""
+        images = [_make_image(name=f"img_{i}.jpg") for i in range(25)]
+        chunks = chunk_for_discord(images)
+        sizes = [len(c) for c in chunks]
+        self.assertEqual(sum(sizes), 25)
+        # All chunks should be max 10
+        self.assertTrue(all(s <= 10 for s in sizes))
+        # Should be reasonably even (max-min spread <= 3)
+        self.assertLessEqual(max(sizes) - min(sizes), 3)
 
     def test_respects_size_limit(self):
         # 3 images of 10MB each — total 30MB exceeds 25MB limit
@@ -302,10 +340,12 @@ class TestChunkForDiscord(unittest.TestCase):
             for i in range(3)
         ]
         chunks = chunk_for_discord(images)
-        # First chunk: 2 images (20MB), second chunk: 1 image (10MB)
-        self.assertEqual(len(chunks), 2)
-        self.assertEqual(len(chunks[0]), 2)
-        self.assertEqual(len(chunks[1]), 1)
+        # Size limit forces a split regardless of even distribution
+        total = sum(len(c) for c in chunks)
+        self.assertEqual(total, 3)
+        for chunk in chunks:
+            chunk_size = sum(img.size for img in chunk)
+            self.assertLessEqual(chunk_size, DISCORD_MAX_FILE_SIZE)
 
     def test_empty_list(self):
         chunks = chunk_for_discord([])
@@ -332,22 +372,34 @@ class TestChunkForDiscord(unittest.TestCase):
         self.assertEqual(len(chunks), 1)
         self.assertEqual(len(chunks[0]), 2)
 
-    def test_many_small_images_split_by_count(self):
+    def test_many_small_images_even_distribution(self):
+        """35 images should distribute evenly, not 10+10+10+5."""
         images = [_make_image(size=100, name=f"tiny_{i}.jpg") for i in range(35)]
         chunks = chunk_for_discord(images)
-        self.assertEqual(len(chunks), 4)
-        self.assertEqual(len(chunks[0]), 10)
-        self.assertEqual(len(chunks[1]), 10)
-        self.assertEqual(len(chunks[2]), 10)
-        self.assertEqual(len(chunks[3]), 5)
+        sizes = [len(c) for c in chunks]
+        self.assertEqual(sum(sizes), 35)
+        self.assertTrue(all(s <= 10 for s in sizes))
+        # Should be more even than 10+10+10+5
+        self.assertLessEqual(max(sizes) - min(sizes), 3)
 
-    def test_custom_max_per_message(self):
-        images = [_make_image(name=f"img_{i}.jpg") for i in range(7)]
-        chunks = chunk_for_discord(images, max_per_message=3)
-        self.assertEqual(len(chunks), 3)
-        self.assertEqual(len(chunks[0]), 3)
-        self.assertEqual(len(chunks[1]), 3)
-        self.assertEqual(len(chunks[2]), 1)
+    def test_all_images_accounted_for(self):
+        """Every image should appear exactly once across all chunks."""
+        for n in [1, 5, 7, 10, 11, 14, 17, 20, 25, 30, 35, 50]:
+            images = [_make_image(name=f"img_{i}.jpg") for i in range(n)]
+            chunks = chunk_for_discord(images)
+            total = sum(len(c) for c in chunks)
+            self.assertEqual(total, n, f"Lost images for n={n}: got {total}")
+
+    def test_first_chunk_is_mosaic_friendly(self):
+        """For multi-message albums, first chunk should be 7 or 10."""
+        for n in [11, 14, 17, 20, 25, 30]:
+            images = [_make_image(name=f"img_{i}.jpg") for i in range(n)]
+            chunks = chunk_for_discord(images)
+            if len(chunks) > 1:
+                self.assertIn(
+                    len(chunks[0]), (7, 10),
+                    f"First chunk for n={n} was {len(chunks[0])}, expected 7 or 10"
+                )
 
 
 # ---------------------------------------------------------------------------

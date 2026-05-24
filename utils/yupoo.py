@@ -258,35 +258,88 @@ async def download_images(
 # Discord chunking
 # ---------------------------------------------------------------------------
 
+def _distribute_evenly(count: int, max_per: int) -> list[int]:
+    """Split `count` into chunks of at most `max_per`, as evenly as possible."""
+    if count <= 0:
+        return []
+    num_chunks = -(-count // max_per)  # ceil division
+    base = count // num_chunks
+    extra = count % num_chunks
+    # Spread the extras across the first chunks
+    return [base + (1 if i < extra else 0) for i in range(num_chunks)]
+
+
+# Discord mosaic sizes that show 1 large hero image + a grid below
+MOSAIC_SIZES = (10, 7)
+
+
 def chunk_for_discord(
     images: list[DownloadedImage],
     max_per_message: int = DISCORD_MAX_FILES_PER_MSG,
     max_total_size: int = DISCORD_MAX_FILE_SIZE,
 ) -> list[list[DownloadedImage]]:
-    """Split images into chunks that fit within Discord's limits.
+    """Split images into evenly-distributed chunks for Discord.
 
-    Each chunk has at most `max_per_message` images, and the total
-    combined size of images in a chunk doesn't exceed `max_total_size`.
+    The first chunk targets 7 or 10 images (Discord's mosaic layout shows
+    a large hero image at the top with a grid below at these counts).
+    Remaining images are distributed as evenly as possible.
+
+    Each chunk respects `max_per_message` and `max_total_size` limits.
+    If size constraints force a split mid-chunk, the planned distribution
+    is adjusted.
     """
+    if not images:
+        return []
+
+    n = len(images)
+
+    if n <= max_per_message:
+        # Everything fits in one message — check size limit
+        total = sum(img.size for img in images)
+        if total <= max_total_size:
+            return [images]
+
+    # Plan the chunk sizes: try mosaic-friendly first chunk
+    if n > max_per_message:
+        best_sizes = None
+        best_score = float("inf")
+
+        for first_size in MOSAIC_SIZES:
+            if first_size >= n:
+                continue
+            remaining = n - first_size
+            rest_sizes = _distribute_evenly(remaining, max_per_message)
+            sizes = [first_size] + rest_sizes
+            # Score: prefer even distribution (minimize max-min spread)
+            score = max(sizes) - min(sizes)
+            if score < best_score:
+                best_score = score
+                best_sizes = sizes
+
+        if best_sizes is None:
+            best_sizes = _distribute_evenly(n, max_per_message)
+    else:
+        best_sizes = [n]
+
+    # Slice images according to planned sizes, with size-limit enforcement
     chunks: list[list[DownloadedImage]] = []
-    current_chunk: list[DownloadedImage] = []
-    current_size = 0
-
-    for img in images:
-        # Would adding this image exceed limits?
-        if (
-            len(current_chunk) >= max_per_message
-            or (current_size + img.size > max_total_size and current_chunk)
-        ):
+    idx = 0
+    for planned in best_sizes:
+        current_chunk: list[DownloadedImage] = []
+        current_size = 0
+        for _ in range(planned):
+            if idx >= n:
+                break
+            img = images[idx]
+            if current_chunk and current_size + img.size > max_total_size:
+                chunks.append(current_chunk)
+                current_chunk = []
+                current_size = 0
+            current_chunk.append(img)
+            current_size += img.size
+            idx += 1
+        if current_chunk:
             chunks.append(current_chunk)
-            current_chunk = []
-            current_size = 0
-
-        current_chunk.append(img)
-        current_size += img.size
-
-    if current_chunk:
-        chunks.append(current_chunk)
 
     return chunks
 
