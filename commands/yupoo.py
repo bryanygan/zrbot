@@ -49,8 +49,11 @@ def setup(bot: commands.Bot):
         vendor, album_id = parsed
         cap = min(max_images, MAX_IMAGES_DEFAULT) if max_images else MAX_IMAGES_DEFAULT
 
-        # Defer ephemerally so the command invocation (with URL) stays hidden
-        await interaction.response.defer(ephemeral=True)
+        is_guild = interaction.guild is not None
+
+        # In guilds: defer ephemerally to hide the URL, send images via channel.send().
+        # In DMs: defer normally, send images via user.send() so they're visible.
+        await interaction.response.defer(ephemeral=is_guild)
 
         try:
             album, downloaded = await fetch_album_images(url, max_images=cap)
@@ -74,9 +77,8 @@ def setup(bot: commands.Bot):
 
         chunks = chunk_for_discord(downloaded)
 
-        # In guilds, send via channel.send() so images aren't tied to the command.
-        # In DMs, the bot can't access the DM channel directly, so use followup.
-        if interaction.guild:
+        if is_guild:
+            # Guild: send via channel.send() so images aren't tied to the command
             for chunk in chunks:
                 files = [
                     discord.File(fp=io.BytesIO(img.data), filename=img.filename)
@@ -87,11 +89,15 @@ def setup(bot: commands.Bot):
                 f"Sent {len(downloaded)} QC image(s).", ephemeral=True
             )
         else:
+            # DM: send images directly to the user
             for chunk in chunks:
                 files = [
                     discord.File(fp=io.BytesIO(img.data), filename=img.filename)
                     for img in chunk
                 ]
-                await interaction.followup.send(files=files)
+                await interaction.user.send(files=files)
+            await interaction.followup.send(
+                f"Sent {len(downloaded)} QC image(s)."
+            )
 
     logger.info("Yupoo commands registered (qc)")
