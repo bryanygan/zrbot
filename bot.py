@@ -12,6 +12,7 @@ from config import (
     DISCORD_TOKEN, OWNER_ID, GUILD_ID,
     TARGET_CHANNEL_ID, NOTIFICATION_CHANNEL_ID,
     USPS_CONSUMER_KEY, USPS_CONSUMER_SECRET,
+    TRACKING_ENABLED,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -431,22 +432,30 @@ async def on_interaction(interaction: discord.Interaction):
 # ---------------------------------------------------------------------------
 
 from commands import address as address_commands
-from commands import tracking as tracking_commands
 from commands import deals as deals_commands
 from commands import yupoo as yupoo_commands
 
 address_commands.setup(bot)
-tracking_commands.setup(bot)
 deals_commands.setup(bot)
 yupoo_commands.setup(bot)
 
-# Set up tracking monitor if USPS credentials are configured
-if USPS_CONSUMER_KEY and USPS_CONSUMER_SECRET:
-    from utils.tracking_monitor import TrackingMonitor
-    bot.tracking_monitor = TrackingMonitor(bot, USPS_CONSUMER_KEY, USPS_CONSUMER_SECRET)
+# USPS tracking is gated by TRACKING_ENABLED — flip the flag in config.py (or
+# set TRACKING_ENABLED=1 in .env) to register the slash commands and start the
+# poller again. Code remains intact in commands/tracking.py and
+# utils/tracking_monitor.py.
+if TRACKING_ENABLED:
+    from commands import tracking as tracking_commands
+    tracking_commands.setup(bot)
+
+    if USPS_CONSUMER_KEY and USPS_CONSUMER_SECRET:
+        from utils.tracking_monitor import TrackingMonitor
+        bot.tracking_monitor = TrackingMonitor(bot, USPS_CONSUMER_KEY, USPS_CONSUMER_SECRET)
+    else:
+        bot.tracking_monitor = None
+        logger.warning("USPS tracking monitor disabled (no credentials)")
 else:
     bot.tracking_monitor = None
-    logger.warning("USPS tracking monitor disabled (no credentials)")
+    logger.info("USPS tracking disabled via TRACKING_ENABLED flag")
 
 
 # ---------------------------------------------------------------------------
@@ -549,8 +558,11 @@ async def on_ready():
 
     # Log startup to activity channel
     from utils.tracking_monitor import _log_to_channel
-    tracking_count = len(bot.tracking_monitor.tracking_data) if bot.tracking_monitor else 0
-    await _log_to_channel(bot, f"\U0001f7e2 **ZR Bot online** — tracking {tracking_count} package(s)")
+    if bot.tracking_monitor:
+        tracking_count = len(bot.tracking_monitor.tracking_data)
+        await _log_to_channel(bot, f"\U0001f7e2 **ZR Bot online** — tracking {tracking_count} package(s)")
+    else:
+        await _log_to_channel(bot, "\U0001f7e2 **ZR Bot online**")
 
 
 # ---------------------------------------------------------------------------

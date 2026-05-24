@@ -20,6 +20,11 @@ NOTIFICATION_CHANNEL_ID = os.getenv('NOTIFICATION_CHANNEL_ID', '1377459975089295
 USPS_CONSUMER_KEY = os.getenv('USPS_CONSUMER_KEY', '')
 USPS_CONSUMER_SECRET = os.getenv('USPS_CONSUMER_SECRET', '')
 
+# Feature flag: when False, USPS tracking commands are not registered and the
+# tracking monitor is not started. Flip to True (or set TRACKING_ENABLED=1 in
+# .env) to bring tracking back online without code changes.
+TRACKING_ENABLED = os.getenv('TRACKING_ENABLED', '0') in ('1', 'true', 'True')
+
 # Shipping "From" address (for CSV generation)
 SHIP_FROM_NAME = 'ZR Fulfillment'
 SHIP_FROM_STREET = '2930 Chestnut St'
