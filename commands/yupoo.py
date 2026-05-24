@@ -72,19 +72,26 @@ def setup(bot: commands.Bot):
                 ephemeral=True,
             )
 
-        # Send images directly to the channel (not as a reply to the command)
-        channel = interaction.channel
         chunks = chunk_for_discord(downloaded)
 
-        for chunk in chunks:
-            files = [
-                discord.File(fp=io.BytesIO(img.data), filename=img.filename)
-                for img in chunk
-            ]
-            await channel.send(files=files)
-
-        await interaction.followup.send(
-            f"Sent {len(downloaded)} QC image(s).", ephemeral=True
-        )
+        # In guilds, send via channel.send() so images aren't tied to the command.
+        # In DMs, the bot can't access the DM channel directly, so use followup.
+        if interaction.guild:
+            for chunk in chunks:
+                files = [
+                    discord.File(fp=io.BytesIO(img.data), filename=img.filename)
+                    for img in chunk
+                ]
+                await interaction.channel.send(files=files)
+            await interaction.followup.send(
+                f"Sent {len(downloaded)} QC image(s).", ephemeral=True
+            )
+        else:
+            for chunk in chunks:
+                files = [
+                    discord.File(fp=io.BytesIO(img.data), filename=img.filename)
+                    for img in chunk
+                ]
+                await interaction.followup.send(files=files)
 
     logger.info("Yupoo commands registered (qc)")
