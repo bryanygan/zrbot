@@ -49,7 +49,8 @@ def setup(bot: commands.Bot):
         vendor, album_id = parsed
         cap = min(max_images, MAX_IMAGES_DEFAULT) if max_images else MAX_IMAGES_DEFAULT
 
-        await interaction.response.defer()
+        # Defer ephemerally so the command invocation (with URL) stays hidden
+        await interaction.response.defer(ephemeral=True)
 
         try:
             album, downloaded = await fetch_album_images(url, max_images=cap)
@@ -62,14 +63,17 @@ def setup(bot: commands.Bot):
         if not album.images:
             return await interaction.followup.send(
                 f"No images found in album `{album_id}` from `{vendor}`.",
+                ephemeral=True,
             )
 
         if not downloaded:
             return await interaction.followup.send(
                 f"Found {len(album.images)} image(s) but all failed to download.",
+                ephemeral=True,
             )
 
-        # Split images into Discord-safe chunks and send
+        # Send images directly to the channel (not as a reply to the command)
+        channel = interaction.channel
         chunks = chunk_for_discord(downloaded)
 
         for chunk in chunks:
@@ -77,6 +81,10 @@ def setup(bot: commands.Bot):
                 discord.File(fp=io.BytesIO(img.data), filename=img.filename)
                 for img in chunk
             ]
-            await interaction.followup.send(files=files)
+            await channel.send(files=files)
+
+        await interaction.followup.send(
+            f"Sent {len(downloaded)} QC image(s).", ephemeral=True
+        )
 
     logger.info("Yupoo commands registered (qc)")
