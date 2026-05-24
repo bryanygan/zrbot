@@ -49,11 +49,10 @@ def setup(bot: commands.Bot):
         vendor, album_id = parsed
         cap = min(max_images, MAX_IMAGES_DEFAULT) if max_images else MAX_IMAGES_DEFAULT
 
-        is_guild = interaction.guild is not None
-
-        # In guilds: defer ephemerally to hide the URL, send images via channel.send().
-        # In DMs: defer normally, send images via user.send() so they're visible.
-        await interaction.response.defer(ephemeral=is_guild)
+        # Defer ephemerally — hides the command (and URL) from other users.
+        # The first followup consumes this ephemeral response, then subsequent
+        # followups are sent as public messages visible to everyone.
+        await interaction.response.defer(ephemeral=True)
 
         try:
             album, downloaded = await fetch_album_images(url, max_images=cap)
@@ -75,29 +74,18 @@ def setup(bot: commands.Bot):
                 ephemeral=True,
             )
 
-        chunks = chunk_for_discord(downloaded)
+        # First followup: ephemeral confirmation (consumes the deferred response)
+        await interaction.followup.send(
+            f"Sending {len(downloaded)} QC image(s)...", ephemeral=True
+        )
 
-        if is_guild:
-            # Guild: send via channel.send() so images aren't tied to the command
-            for chunk in chunks:
-                files = [
-                    discord.File(fp=io.BytesIO(img.data), filename=img.filename)
-                    for img in chunk
-                ]
-                await interaction.channel.send(files=files)
-            await interaction.followup.send(
-                f"Sent {len(downloaded)} QC image(s).", ephemeral=True
-            )
-        else:
-            # DM: send images directly to the user
-            for chunk in chunks:
-                files = [
-                    discord.File(fp=io.BytesIO(img.data), filename=img.filename)
-                    for img in chunk
-                ]
-                await interaction.user.send(files=files)
-            await interaction.followup.send(
-                f"Sent {len(downloaded)} QC image(s)."
-            )
+        # Remaining followups: public messages with images
+        chunks = chunk_for_discord(downloaded)
+        for chunk in chunks:
+            files = [
+                discord.File(fp=io.BytesIO(img.data), filename=img.filename)
+                for img in chunk
+            ]
+            await interaction.followup.send(files=files)
 
     logger.info("Yupoo commands registered (qc)")
