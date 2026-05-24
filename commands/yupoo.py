@@ -69,39 +69,14 @@ def setup(bot: commands.Bot):
                 f"Found {len(album.images)} image(s) but all failed to download.",
             )
 
-        # Build header embed
-        title = album.title or album_id
-        embed = discord.Embed(
-            title=f"QC: {title}",
-            description=(
-                f"**Vendor:** {vendor}\n"
-                f"**Images:** {len(downloaded)}/{len(album.images)}"
-                + (f" (capped at {cap})" if cap < len(album.images) else "")
-            ),
-            url=album.url,
-            color=0x5865F2,
-        )
-
-        # Split images into Discord-safe chunks
+        # Split images into Discord-safe chunks and send
         chunks = chunk_for_discord(downloaded)
 
-        # Send first chunk with the embed
-        first_chunk = chunks[0]
-        files = [
-            discord.File(fp=io.BytesIO(img.data), filename=img.filename)
-            for img in first_chunk
-        ]
-        await interaction.followup.send(embed=embed, files=files)
-
-        # Send remaining chunks as follow-up messages
-        for i, chunk in enumerate(chunks[1:], 2):
+        for chunk in chunks:
             files = [
                 discord.File(fp=io.BytesIO(img.data), filename=img.filename)
                 for img in chunk
             ]
-            await interaction.followup.send(
-                content=f"**{title}** ({i}/{len(chunks)})",
-                files=files,
-            )
+            await interaction.followup.send(files=files)
 
     logger.info("Yupoo commands registered (qc)")
