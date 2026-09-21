@@ -10,7 +10,7 @@ from discord.ext import commands
 
 from config import (
     DISCORD_TOKEN, OWNER_ID, GUILD_ID,
-    TARGET_CHANNEL_ID, NOTIFICATION_CHANNEL_ID,
+    TARGET_CHANNEL_ID, NOTIFICATION_CHANNEL_ID, REACTION_CHANNEL_ID,
     USPS_CONSUMER_KEY, USPS_CONSUMER_SECRET,
     TRACKING_ENABLED,
 )
@@ -70,6 +70,15 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_message(message: discord.Message):
+    # React with ✅ / ❌ on every new message (including bots/webhooks) in the reaction channel
+    if str(message.channel.id) == REACTION_CHANNEL_ID:
+        for emoji in ("✅", "❌"):
+            try:
+                await message.add_reaction(emoji)
+            except discord.HTTPException as e:
+                logger.error("Failed to add %s reaction to message %s: %s", emoji, message.id, e)
+                break
+
     if message.author.bot:
         return
 
